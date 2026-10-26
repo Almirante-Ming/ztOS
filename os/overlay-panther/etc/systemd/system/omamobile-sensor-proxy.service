@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT
+# iio-sensor-proxy's D-Bus API from the AoC's sensors, at boot after the AoC
+# (ztos-aoc.service). ztOS: omarchy-mobile's unit after ztos-aoc.service.
+[Unit]
+Description=Sensor proxy for the AoC's sensors (net.hadess.SensorProxy)
+Requires=ztos-aoc.service
+After=ztos-aoc.service dbus.service
+ConditionPathExists=/dev/acd-com.google.usf
+
+[Service]
+Type=dbus
+BusName=net.hadess.SensorProxy
+ExecStart=/usr/bin/omamobile-sensor-proxy
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

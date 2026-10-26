@@ -1,0 +1,9 @@
+# ztOS on the Pixel 7 (panther): the kernel is ztOS's own boot image, not a
+# package (scripts/build-boot-panther.sh); its modules are copied in by the build.
+dnsmasq
+bluez
+bluez-utils
+wireless-regdb
+python-gobject
+alsa-ucm-conf
+swh-plugins

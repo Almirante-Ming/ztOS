@@ -6,6 +6,7 @@
     ztos install --target starlte   ztOS on a Galaxy S9
     ztos emulator                start the emulator with the ztOS installed there
     ztos build --target T        only build the system (for qemu: the disk too)
+    ztos build --target panther  the system for a Pixel 7; scripts/flash-panther.sh writes it
     ztos guide                   how installing on the phone goes, step by step
     ztos doctor                  is this computer ready to build ztOS?
 """
@@ -104,6 +105,9 @@ def wizard(args) -> b.Settings:
 
 
 def cmd_install(args):
+    if args.target == "panther":
+        raise b.Fail("the Pixel 7 is installed from fastboot, not TWRP: installer/ztos build --target panther, "
+                     "then scripts/flash-panther.sh (see kernel/panther/README.md)")
     mode = getattr(args, "mode", None)
     if not mode and not args.yes:
         print(BANNER)
@@ -210,7 +214,7 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command")
 
     def with_settings(p):
-        p.add_argument("--target", choices=["qemu", "starlte"])
+        p.add_argument("--target", choices=["qemu", "starlte", "panther"])
         p.add_argument("--user")
         p.add_argument("--password", help="(else asked; never stored)")
         p.add_argument("--hostname")

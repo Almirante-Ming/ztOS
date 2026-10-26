@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: MIT
+# ztOS: give the BCM4389 Bluetooth controller its real address
+# (ztos-bt-addr@.service).
+ACTION=="add", SUBSYSTEM=="bluetooth", KERNEL=="hci[0-9]*", DRIVERS=="hci_uart_bcm", TAG+="systemd", ENV{SYSTEMD_WANTS}+="ztos-bt-addr@%k.service"

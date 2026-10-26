@@ -1,0 +1,4 @@
+# ztOSCoreSensorFramework (ztOS on the Pixel 7, first light): none of the
+# phone's hardware has its ztOS support yet; only the session's own pieces
+# are watched.
+session|ztapps||App list

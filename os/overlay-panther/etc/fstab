@@ -1,0 +1,2 @@
+# ztOS on the Pixel 7: the root is USERDATA, ext4 labelled ZR_ARCH
+LABEL=ZR_ARCH  /  ext4  rw,noatime  0  1

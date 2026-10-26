@@ -35,7 +35,7 @@
 #define ZMC_TILT_IN_MS	70
 #define ZMC_TILT_OUT_MS	160
 #define ZMC_MARGIN	16	/* left edge of everything: 20 px on a 450 px wide reference */
-#define ZMC_HEADER_H	104	/* the title stays; the list moves under it */
+#define ZMC_HEADER_H	76	/* the title stays; the list moves under it */
 #define ZMC_ACT_BACK	(-1)	/* the title: up a page */
 #define ZMC_ACT_PIVOT	(-2)	/* the next tab's title: slide to it (arg: its page) */
 #define ZMC_MAX_HITS	160
@@ -211,6 +211,9 @@ double zmc_pivot(cairo_t *cr, const char *title, const char *next);
 /* the same, with the next tab's title a thing to tap: it gives (action, arg) */
 double zmc_pivot_next(cairo_t *cr, const char *title, const char *next, int action, int arg);
 double zmc_entry(cairo_t *cr, double y, const char *title, const char *detail, int action, int arg);
+/* the same with an icon at the left: `icon` draws a 24 by 24 glyph at (x, y) */
+double zmc_entry_icon(cairo_t *cr, double y, void (*icon)(cairo_t *, double, double),
+		const char *title, const char *detail, int action, int arg);
 /* a title with On/Off under it and a switch on the right; returns the next y */
 double zmc_switch(cairo_t *cr, double y, const char *title, bool on, int action);
 /* a grey caption with a value under it; returns the next y */

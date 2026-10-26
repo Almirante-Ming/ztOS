@@ -118,7 +118,7 @@ static bool demoloop_active(void) {
 #define SHADE_MAX_H	((double)(server->height - NAV_H))
 #define SHADE_MS	260	/* settling after the finger lets go */
 #define SCREEN_TIMEOUT_S 60	/* idle time before the screen sleeps, by default */
-#define TOP_PAD		14	/* Start: above the first row */
+#define TOP_PAD		6	/* Start: above the first row (Windows 10 Mobile: tight under the bar) */
 #define MAX_UNITS	8	/* Start: the most small tiles a row can hold */
 #define EDGE		18	/* how close to the glass edge a system gesture starts */
 #define SWIPE		56	/* how far a system gesture has to travel */
@@ -132,18 +132,17 @@ static bool demoloop_active(void) {
 #define MAX_GLYPHS	640
 #define MAX_STARTED	48
 #define GLYPH_PX	192	/* a glyph made by ztapps, pixels each way */
-/* The app list, as measured on the Lumia (0:175 of the capture, 506 px of
- * screen to our 360 points): the column starts 80 points in, each square is
- * 45, one row to the next 55, the first square's top 17 below the status bar;
- * a letter is an outline of the accent colour with the letter in its corner. */
-#define LIST_ICON	45
-#define LIST_ROW_H	55
-#define LIST_LEFT	80
-#define LIST_TOP	17
-#define ROUND		31	/* the round buttons: search on the list, the arrow on Start */
-#define SEARCH_X	51	/* the search button's middle, from the left */
-#define SEARCH_BOX_H	40	/* the box typed into while searching the list */
-#define SEARCH_BOX_Y	(STATUS_H + 12)
+/* The app list, as Windows 10 Mobile has it: a search box across the top,
+ * then the column 12 points in, a square of 40 for each application's glyph
+ * and one row to the next 50; a letter is the letter alone, in white. */
+#define LIST_ICON	40
+#define LIST_ROW_H	50
+#define LIST_HEAD_H	42	/* a letter's row, to the next */
+#define LIST_LEFT	12
+#define SEARCH_BOX_H	34	/* the search box: tapped, it is typed into */
+#define SEARCH_BOX_Y	(STATUS_H + 10)
+#define LIST_TOP	(10 + SEARCH_BOX_H + 14)
+#define ROUND		31	/* the round button: the arrow (unused since Windows 10 Mobile) */
 #define LIST_SPAN	110.0f	/* a row turns in and out as a tile this wide would */
 /* Scrolling with weight. Let go, a list coasts and loses its speed by e every
  * SCROLL_TAU_MS; past either end it follows the finger at a third of the
@@ -603,6 +602,7 @@ struct zt_server {
 	float keypop_x, keypop_y;
 	float shade_h;			/* pull-down height of the Action Center shade */
 	bool shade_open;
+	bool shade_collapsed;	/* the action centre with one row of quick actions */
 	bool shade_wifi;
 	bool shade_bt;
 	/* Bluetooth as ztos-bt-state writes it: the status icon, the live tile */
@@ -1200,6 +1200,11 @@ static struct zt_buffer *zt_buffer_create(struct zt_server *server, double w, do
  * under the name set just before it is made. That is how the look is checked
  * without touching the session on the screen. */
 static const char *g_dump_dir, *g_dump_name;
+
+/* ZTMETRO_PREVIEW=WxH: the whole shell, live, on a headless screen of that
+ * many pixels, for screenshots (grim) next to the session on the phone. It
+ * leaves the backlight, the vibrator and the other daemons alone. */
+static int g_preview_w, g_preview_h;
 
 /* Finish the drawing and make it `layer`'s texture. Cairo's ARGB32 is BGRA in
  * memory; it is uploaded as it is and the shader swaps the channels. */
@@ -2012,7 +2017,7 @@ static void haptics_init(struct zt_server *server) {
 }
 
 static void hap(struct zt_server *server, enum hap_kind kind, enum hap_group group) {
-	if (!server->haptics_enabled || server->haptic_level[group] <= 0) {
+	if (g_preview_w || !server->haptics_enabled || server->haptic_level[group] <= 0) {
 		return;
 	}
 	if (server->haptic_fd < 0) {
@@ -2094,11 +2099,11 @@ enum quick {
 	Q_BRIGHTNESS, Q_SETTINGS, Q_VIBRATE, Q_NONE, Q_COUNT,
 };
 static const struct { const char *id, *icon, *label; } QUICK[Q_COUNT] = {
-	{ "wifi", "wifi", "WI-FI" }, { "data", "", "MOBILE DATA" },
-	{ "bluetooth", "bluetooth", "BLUETOOTH" }, { "airplane", "airplane", "AIRPLANE MODE" },
-	{ "rotation", "rotation", "ROTATION LOCK" }, { "flashlight", "flashlight", "FLASHLIGHT" },
-	{ "location", "location", "LOCATION" }, { "brightness", "brightness", "BRIGHTNESS" },
-	{ "settings", "gear", "ALL SETTINGS" }, { "vibrate", "", "VIBRATION" }, { "none", "", "" },
+	{ "wifi", "wifi", "Wi-Fi" }, { "data", "", "Mobile data" },
+	{ "bluetooth", "bluetooth", "Bluetooth" }, { "airplane", "airplane", "Airplane mode" },
+	{ "rotation", "rotation", "Rotation lock" }, { "flashlight", "flashlight", "Flashlight" },
+	{ "location", "location", "Location" }, { "brightness", "brightness", "Brightness" },
+	{ "settings", "gear", "All settings" }, { "vibrate", "", "Vibration" }, { "none", "", "" },
 };
 static const int QUICK_DEFAULT[8] = {
 	Q_WIFI, Q_DATA, Q_BLUETOOTH, Q_AIRPLANE, Q_ROTATION, Q_FLASHLIGHT, Q_BRIGHTNESS, Q_SETTINGS,
@@ -2578,7 +2583,7 @@ static void backlight_init(struct zt_server *server) {
 
 /* 1..100 %. */
 static void backlight_set(int percent) {
-	if (!backlight_usable()) {
+	if (g_preview_w || !backlight_usable()) {
 		return;
 	}
 	if (percent < 1) percent = 1;
@@ -2640,6 +2645,9 @@ static void backlight_set(int percent) {
  * (pixel values darkened by m give m^2.2 of the light); nothing with
  * brightnessctl, which the panel itself has set to the exact level. */
 static float backlight_darkening(int percent) {
+	if (g_preview_w) {
+		return 0.0f;	/* a screenshot shows the drawing as it is */
+	}
 	if (!backlight_usable()) {
 		return percent < 100 ? 0.85f * (100 - percent) / 100.0f : 0.0f;
 	}
@@ -2903,10 +2911,13 @@ static void load_builtin_tiles(struct zt_server *server) {
 }
 
 /* First-fit packing into a grid `units` small tiles wide, the way Start flows.
- * The gutter is 2 % of the width and the side margins twice that. */
+ * Windows 10 Mobile packs its tiles closer than 8.1 did: 4 points between
+ * them (about 1 % of the width) and a margin a little wider at the sides. */
+#define TILE_GUTTER	4
+#define TILE_MARGIN	6
 static void place_tiles(struct zt_server *server) {
-	double gutter = round(server->width * 0.02);
-	double margin = 2 * gutter;
+	double gutter = TILE_GUTTER;
+	double margin = TILE_MARGIN;
 	double unit = (server->width - 2 * margin - (server->units - 1) * gutter) / server->units;
 	bool *taken = calloc(MAX_UNITS * MAX_TILES * 2, sizeof(bool));
 	int rows = 0;
@@ -2972,9 +2983,10 @@ static void place_tiles(struct zt_server *server) {
 	}
 	free(taken);
 	double visible = server->height - STATUS_H - NAV_H;
-	/* under the last row, on the right: the arrow into the app list */
-	server->arrow_y = TOP_PAD + rows * (unit + gutter) + 10;
-	server->start_h = server->arrow_y + ROUND + 24;
+	/* Windows 10 Mobile has no arrow under the tiles: the app list is a
+	 * swipe away. Start ends a little under its last row. */
+	server->arrow_y = TOP_PAD + rows * (unit + gutter);
+	server->start_h = server->arrow_y + 48;
 	if (server->start_h < visible) {
 		server->start_h = visible;
 	}
@@ -3143,6 +3155,10 @@ static void draw_glyph(struct zt_server *server, cairo_t *cr, const char *icon,
 #define WALL_PARALLAX	0.25	/* Start's photo moves at a quarter of the tiles' speed */
 #define WALL_TALL	1.6	/* and is this many screens tall, for that */
 #define WALL_TINT	0.15	/* black over a tile's window onto the photo, for its label */
+/* Windows 10 Mobile's "full-screen image": the photo fills Start behind the
+ * tiles, darkened, and the tiles are the accent colour, see-through */
+#define WALL_DIM	0.30	/* black over the photo behind Start */
+#define TILE_GLASS	0.72	/* a tile's accent over it */
 
 /* A photo scaled to cover pw x ph pixels and cropped about its middle, as a
  * cairo image (premultiplied ARGB). NULL if it cannot be read. */
@@ -3210,6 +3226,8 @@ static void walls_load(struct zt_server *server) {
 			cairo_set_source_surface(cr, img, 0, 0);
 			cairo_paint(cr);
 			cairo_surface_destroy(img);
+			cairo_set_source_rgba(cr, 0, 0, 0, WALL_DIM);
+			cairo_paint(cr);
 			g_dump_name = "start-wallpaper";
 			zt_buffer_show(server, &server->wall_layer, buffer, cr, server->width, h);
 			server->wall_h = h;
@@ -3217,25 +3235,29 @@ static void walls_load(struct zt_server *server) {
 	}
 }
 
-/* A tile's window onto Start's photo: the part of it behind the tile, drawn
- * with the tile's own transform (`m`, before its last scale to w x h), so it
- * leans and turns with the tile. The photo rides at WALL_PARALLAX of the
- * scroll. */
-static void wall_under(struct zt_server *server, const float model[16], double tx, double ty,
-		double tw, double th, float alpha) {
+/* Start's photo, the whole screen under the status bar: behind the tiles,
+ * which are see-through over it. It rides at WALL_PARALLAX of the scroll and
+ * goes aside with Start (`dx`) when the app list comes in. */
+static void draw_wall(struct zt_server *server, float dx, float alpha) {
 	struct zt_layer *w = &server->wall_layer;
 	if (server->wall_h <= 0 || !w->tex || !w->tw || !w->th) {
 		return;
 	}
-	double py = STATUS_H + ty - server->scroll * (1.0 - WALL_PARALLAX);
+	/* the whole screen, under the status row too (draw_status leaves it
+	 * see-through, as Windows 10 Mobile's Start does) */
+	double th = server->height;
+	double py = server->scroll * WALL_PARALLAX;
 	double max = server->wall_h - th;
 	py = py < 0 ? 0 : py > max ? max : py;
 	double s = server->scale;
-	server->uv_off[0] = (float)(tx * s / w->tw);
+	float m[16];
+	mat_identity(m);
+	mat_translate(m, dx, 0);
+	mat_scale(m, server->width, (float)th);
 	server->uv_off[1] = (float)(py * s / w->th);
-	quad(server, GL_TEXTURE_2D, w->tex, model, alpha, true, true,
-		(float)(tw * s / w->tw), (float)(th * s / w->th));
-	server->uv_off[0] = server->uv_off[1] = 0;
+	quad(server, GL_TEXTURE_2D, w->tex, m, alpha, true, true,
+		(float)(server->width * s / w->tw), (float)(th * s / w->th));
+	server->uv_off[1] = 0;
 }
 
 static double text_width(const char *text, const char *font, double size);
@@ -3244,22 +3266,23 @@ static void draw_tile(struct zt_server *server, int i) {
 	struct tile *t = &server->tiles[i];
 	cairo_t *cr;
 	struct zt_buffer *buffer = zt_buffer_create(server, t->w, t->h, &cr);
+	set_rgb(cr, t->color);
 	if (server->wall_h > 0) {
-		/* a window onto Start's photo (wall_under), darkened a little */
-		cairo_set_source_rgba(cr, 0, 0, 0, WALL_TINT);
+		/* over the full-screen photo (draw_wall): see-through */
+		cairo_paint_with_alpha(cr, TILE_GLASS);
 	} else {
-		set_rgb(cr, t->color);
+		cairo_paint(cr);
 	}
-	cairo_paint(cr);
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	/* a glyph made from an icon fills its box to the edge: a little smaller */
 	double k = t->icon[0] == '@' ? 0.86 : 1.0;
 	if (t->size == TILE_SMALL) {
-		draw_glyph(server, cr, t->icon, t->label, t->w / 2, t->h / 2, t->h * 0.56 * k);
+		draw_glyph(server, cr, t->icon, t->label, t->w / 2, t->h / 2, t->h * 0.5 * k);
 	} else {
-		/* icon slightly above centre, label at the bottom left */
-		draw_glyph(server, cr, t->icon, t->label, t->w / 2, t->h * 0.44, t->h * 0.46 * k);
-		draw_text(cr, t->label, FONT_REGULAR, 13, 8, t->h - 23, t->w - 16, 0, false);
+		/* Windows 10 Mobile: the icon in the middle, a little smaller than
+		 * 8.1's, and the name small at the bottom left */
+		draw_glyph(server, cr, t->icon, t->label, t->w / 2, t->h * 0.46, t->h * 0.4 * k);
+		draw_text(cr, t->label, FONT_REGULAR, 12, 7, t->h - 21, t->w - 14, 0, false);
 	}
 	if (t->live && t->live_count > 0) {
 		/* the count, top right, as a Flip tile's front has it */
@@ -3305,12 +3328,12 @@ static void draw_tile_back(struct zt_server *server, int i) {
 	struct tile *t = &server->tiles[i];
 	cairo_t *cr;
 	struct zt_buffer *buffer = zt_buffer_create(server, t->w, t->h, &cr);
+	set_rgb(cr, t->color);
 	if (server->wall_h > 0) {
-		cairo_set_source_rgba(cr, 0, 0, 0, WALL_TINT);
+		cairo_paint_with_alpha(cr, TILE_GLASS);
 	} else {
-		set_rgb(cr, t->color);
+		cairo_paint(cr);
 	}
-	cairo_paint(cr);
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	double size = BACK_LINE_SIZE(t);
 	for (int k = 0; k < 3; k++) {
@@ -3574,23 +3597,21 @@ static void draw_item(struct zt_server *server, int i) {
 	struct app_item *it = &server->items[i];
 	double max = server->width - list_margin(server) - 8;
 	double w = it->header ? LIST_ICON :
-		fmin(max, LIST_ICON + 13 + text_width(it->name, FONT_SEMILIGHT, 22) + 6);
+		fmin(max, LIST_ICON + 12 + text_width(it->name, FONT_REGULAR, 17) + 6);
 	cairo_t *cr;
 	struct zt_buffer *buffer = zt_buffer_create(server, w, LIST_ICON, &cr);
-	set_rgb(cr, server->accent);
 	if (it->header) {
-		cairo_set_line_width(cr, 1.5);
-		cairo_rectangle(cr, 0.75, 0.75, LIST_ICON - 1.5, LIST_ICON - 1.5);
-		cairo_stroke(cr);
-		draw_text(cr, it->name, FONT_SEMILIGHT, 27, 4, LIST_ICON - 38, 0, 0, false);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		draw_text(cr, it->name, FONT_SEMILIGHT, 22, 2, 6, 0, 0, false);
 	} else {
+		set_rgb(cr, server->accent);
 		cairo_rectangle(cr, 0, 0, LIST_ICON, LIST_ICON);
 		cairo_fill(cr);
 		cairo_set_source_rgb(cr, 1, 1, 1);
 		char icon[80];
 		snprintf(icon, sizeof(icon), "@%s", it->key);
-		draw_glyph(server, cr, icon, it->name, LIST_ICON / 2.0, LIST_ICON / 2.0, 25);
-		draw_text(cr, it->name, FONT_SEMILIGHT, 22, LIST_ICON + 13, 7, w - LIST_ICON - 13, 0, false);
+		draw_glyph(server, cr, icon, it->name, LIST_ICON / 2.0, LIST_ICON / 2.0, 22);
+		draw_text(cr, it->name, FONT_REGULAR, 17, LIST_ICON + 12, 8, w - LIST_ICON - 12, 0, false);
 	}
 	zt_buffer_show(server, &it->layer, buffer, cr, w, LIST_ICON);
 }
@@ -3606,7 +3627,7 @@ static void list_relayout(struct zt_server *server) {
 		if (!server->searching) {
 			it->hidden = false;
 			it->y = it->y0;
-			y = it->y0 + LIST_ROW_H;
+			y = it->y0 + (it->header ? LIST_HEAD_H : LIST_ROW_H);
 			continue;
 		}
 		it->hidden = it->header || !strcasestr(it->name, server->search);
@@ -3621,53 +3642,70 @@ static void list_relayout(struct zt_server *server) {
 	damage(server);
 }
 
-/* The two round buttons: a circle with an arrow to the right, and one with a
- * magnifying glass. */
+/* The round arrow (Windows Phone 8.1's, kept for nothing now), and the app
+ * list's search box at rest: dark, with "Search" in grey and the glass at
+ * its right, as Windows 10 Mobile has it. */
 static void draw_rounds(struct zt_server *server) {
-	for (int k = 0; k < 2; k++) {
-		cairo_t *cr;
-		struct zt_buffer *buffer = zt_buffer_create(server, ROUND, ROUND, &cr);
-		double c = ROUND / 2.0;
-		cairo_set_source_rgb(cr, 1, 1, 1);
-		cairo_set_line_width(cr, 2);
-		cairo_arc(cr, c, c, c - 1.5, 0, 2 * M_PI);
-		cairo_stroke(cr);
-		if (k == 0) {
-			cairo_move_to(cr, c - 7, c);
-			cairo_line_to(cr, c + 7, c);
-			cairo_move_to(cr, c + 1, c - 6);
-			cairo_line_to(cr, c + 7, c);
-			cairo_line_to(cr, c + 1, c + 6);
-		} else {
-			cairo_arc(cr, c + 2, c - 2, 6, 0, 2 * M_PI);
-			cairo_move_to(cr, c - 2.2, c + 2.2);
-			cairo_line_to(cr, c - 8, c + 8);
-		}
-		cairo_stroke(cr);
-		zt_buffer_show(server, k == 0 ? &server->round_arrow : &server->round_search, buffer, cr,
-			ROUND, ROUND);
-	}
+	cairo_t *cr;
+	struct zt_buffer *buffer = zt_buffer_create(server, ROUND, ROUND, &cr);
+	double c = ROUND / 2.0;
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	cairo_set_line_width(cr, 2);
+	cairo_arc(cr, c, c, c - 1.5, 0, 2 * M_PI);
+	cairo_stroke(cr);
+	cairo_move_to(cr, c - 7, c);
+	cairo_line_to(cr, c + 7, c);
+	cairo_move_to(cr, c + 1, c - 6);
+	cairo_line_to(cr, c + 7, c);
+	cairo_line_to(cr, c + 1, c + 6);
+	cairo_stroke(cr);
+	zt_buffer_show(server, &server->round_arrow, buffer, cr, ROUND, ROUND);
+
+	double w = server->width - 2 * LIST_LEFT, h = SEARCH_BOX_H;
+	buffer = zt_buffer_create(server, w, h, &cr);
+	cairo_set_source_rgb(cr, 0.17, 0.17, 0.17);
+	cairo_paint(cr);
+	cairo_set_source_rgb(cr, 0.4, 0.4, 0.4);
+	cairo_set_line_width(cr, 1);
+	cairo_rectangle(cr, 0.5, 0.5, w - 1, h - 1);
+	cairo_stroke(cr);
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	draw_text(cr, "Search", FONT_REGULAR, 15, 10, 7, w - 44, 0, false);
+	cairo_set_source_rgb(cr, 0.85, 0.85, 0.85);
+	cairo_set_line_width(cr, 1.6);
+	cairo_new_path(cr);
+	cairo_arc(cr, w - 19, h / 2 - 2, 5.5, 0, 2 * M_PI);
+	cairo_stroke(cr);
+	cairo_move_to(cr, w - 22.9, h / 2 + 1.9);
+	cairo_line_to(cr, w - 27.5, h / 2 + 6.5);
+	cairo_stroke(cr);
+	zt_buffer_show(server, &server->round_search, buffer, cr, w, h);
 }
 
 /* What is being searched for: a white box across the screen with a caret
  * after the letters, "search" in grey while there are none, and a magnifying
  * glass at its right. It stays where it is; what it finds scrolls under it. */
 static void draw_search(struct zt_server *server) {
-	double w = server->width - 32, h = SEARCH_BOX_H;
+	double w = server->width - 2 * LIST_LEFT, h = SEARCH_BOX_H;
 	cairo_t *cr;
 	struct zt_buffer *buffer = zt_buffer_create(server, w, h, &cr);
+	/* Windows 10's text box with the focus: white, an accent border */
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	cairo_paint(cr);
-	double tw = server->search[0] ? text_width(server->search, FONT_REGULAR, 19) : 0;
+	set_rgb(cr, server->accent);
+	cairo_set_line_width(cr, 2);
+	cairo_rectangle(cr, 1, 1, w - 2, h - 2);
+	cairo_stroke(cr);
+	double tw = server->search[0] ? text_width(server->search, FONT_REGULAR, 15) : 0;
 	if (server->search[0]) {
 		cairo_set_source_rgb(cr, 0, 0, 0);
-		draw_text(cr, server->search, FONT_REGULAR, 19, 10, 8, w - 52, 0, false);
+		draw_text(cr, server->search, FONT_REGULAR, 15, 10, 7, w - 48, 0, false);
 	} else {
 		cairo_set_source_rgb(cr, 0.55, 0.55, 0.55);
-		draw_text(cr, "search", FONT_REGULAR, 19, 10, 8, w - 52, 0, false);
+		draw_text(cr, "Search", FONT_REGULAR, 15, 10, 7, w - 48, 0, false);
 	}
 	set_rgb(cr, server->accent);
-	cairo_rectangle(cr, 10 + fmin(tw, w - 54) + 1, 9, 2, h - 18);
+	cairo_rectangle(cr, 10 + fmin(tw, w - 50) + 1, 8, 1.5, h - 16);
 	cairo_fill(cr);
 	/* the glass */
 	cairo_set_source_rgb(cr, 0.2, 0.2, 0.2);
@@ -3743,7 +3781,7 @@ static void load_apps(struct zt_server *server) {
 			head->name[0] = first == '#' ? '#' : (char)(first - 'A' + 'a');
 			head->y = head->y0 = y;
 			head->press = 1.0f;
-			y = head->y + LIST_ROW_H;
+			y = head->y + LIST_HEAD_H;
 		}
 		struct app_item *it = &server->items[server->n_items++];
 		snprintf(it->name, sizeof(it->name), "%.*s", (int)sizeof(it->name) - 1, line);
@@ -4569,9 +4607,16 @@ static void draw_status(struct zt_server *server) {
 	server->st_drawn[3] = server->st_plug;
 	cairo_t *cr;
 	struct zt_buffer *buffer = zt_buffer_create(server, server->width, STATUS_H, &cr);
-	double background = server->call_over_lock ? 0.10 : 0;
-	cairo_set_source_rgb(cr, background, background, background);
+	/* see-through: over Start's photo the row floats on it (Windows 10
+	 * Mobile); over an app or the list there is only the black under it */
+	if (server->call_over_lock) {
+		cairo_set_source_rgb(cr, 0.10, 0.10, 0.10);
+	} else {
+		cairo_set_source_rgba(cr, 0, 0, 0, 0);
+	}
+	cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
 	cairo_paint(cr);
+	cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
 	status_row(server, cr, false, true);
 	zt_buffer_show(server, &server->status_layer, buffer, cr, server->width, STATUS_H);
 	bool in_shade = server->shade_open || server->shade_h > 0.1f;
@@ -4843,6 +4888,7 @@ static int clock_tick(void *data) {
 #define SHADE_SIDE	4
 #define SHADE_GAP	3
 #define SHADE_HANDLE	16	/* the bar along the bottom */
+#define SHADE_BG	0.12	/* Windows 10 Mobile's panel: a dark grey, not black */
 
 static void shade_tile_rect(struct zt_server *server, int index, double *x, double *y,
 		double *w, double *h) {
@@ -4852,16 +4898,25 @@ static void shade_tile_rect(struct zt_server *server, int index, double *x, doub
 	*y = SHADE_TOP + (index / 4) * (*h + SHADE_GAP);
 }
 
+/* the quick actions showing: one row collapsed, both expanded */
+static int shade_tiles(struct zt_server *server) {
+	return server->shade_collapsed ? 4 : 8;
+}
+
 static double shade_links_y(struct zt_server *server) {
 	double x, y, w, h;
-	shade_tile_rect(server, 4, &x, &y, &w, &h);
+	shade_tile_rect(server, shade_tiles(server) - 1, &x, &y, &w, &h);
 	return y + h + 12;
 }
 
-/* What is at (x, y) of the panel: 0..7 a quick action, 8 CLEAR ALL,
- * 9 ALL SETTINGS, 10 the bar along the bottom, 20.. a notification, -1 nothing. */
+/* What is at (x, y) of the panel: 0..7 a quick action, 8 Clear all,
+ * 10 the bar along the bottom, 11 Expand / Collapse, 20.. a notification,
+ * -1 nothing. */
 static int shade_hit(struct zt_server *server, double x, double y) {
-	for (int i = 0; i < 8; i++) {
+	if (y >= STATUS_H && y < SHADE_TOP - 2 && x > server->width / 2.0) {
+		return 11;
+	}
+	for (int i = 0; i < shade_tiles(server); i++) {
 		double tx, ty, tw, th;
 		shade_tile_rect(server, i, &tx, &ty, &tw, &th);
 		if (x >= tx && x < tx + tw && y >= ty && y < ty + th) {
@@ -4869,8 +4924,8 @@ static int shade_hit(struct zt_server *server, double x, double y) {
 		}
 	}
 	double links = shade_links_y(server);
-	if (y >= links - 8 && y < links + 26) {
-		return x < server->width / 2.0 ? 8 : 9;
+	if (y >= links - 8 && y < links + 26 && x > server->width / 2.0) {
+		return 8;
 	}
 	if (y >= SHADE_MAX_H - SHADE_HANDLE - 14) {
 		return 10;
@@ -4887,7 +4942,7 @@ static int shade_hit(struct zt_server *server, double x, double y) {
 static void shade_tile_draw(struct zt_server *server, cairo_t *cr, int i, double w, double h) {
 	int q = server->quick[i];
 	if (q == Q_NONE) {
-		cairo_set_source_rgb(cr, 0.07, 0.07, 0.07);
+		cairo_set_source_rgb(cr, SHADE_BG + 0.05, SHADE_BG + 0.05, SHADE_BG + 0.05);
 		cairo_rectangle(cr, 0, 0, w, h);
 		cairo_fill(cr);
 		return;
@@ -4902,11 +4957,11 @@ static void shade_tile_draw(struct zt_server *server, cairo_t *cr, int i, double
 		q == Q_DATA ? server->cell_data_on : q == Q_VIBRATE ? server->haptics_enabled :
 		q == Q_FLASHLIGHT ? server->shade_torch : q == Q_BLUETOOTH ? server->shade_bt :
 		q == Q_BRIGHTNESS;
-	/* on: the accent colour; off: a dark grey block */
+	/* on: the accent colour; off: a grey block, lighter than the panel */
 	if (on) {
 		set_rgb(cr, server->accent);
 	} else {
-		cairo_set_source_rgb(cr, 0.122, 0.122, 0.122);
+		cairo_set_source_rgb(cr, 0.24, 0.24, 0.24);
 	}
 	cairo_rectangle(cr, 0, 0, w, h);
 	cairo_fill(cr);
@@ -4936,18 +4991,18 @@ static void shade_tile_draw(struct zt_server *server, cairo_t *cr, int i, double
 	}
 	char label[32];
 	if (q == Q_BRIGHTNESS) {
-		snprintf(label, sizeof(label), "BRIGHTNESS %d%%", server->shade_brightness);
+		snprintf(label, sizeof(label), "%d%%", server->shade_brightness);
 	} else {
 		snprintf(label, sizeof(label), "%s", QUICK[q].label);
 	}
-	draw_text(cr, label, FONT_SEMIBOLD, 7.6, 7, h - 15, w - 10, 0, false);
+	draw_text(cr, label, FONT_REGULAR, 10, 7, h - 18, w - 10, 0, false);
 }
 
 static void draw_shade(struct zt_server *server) {
 	const double height = SHADE_MAX_H;
 	server->shade_row = false;	/* the panel's own row is as new as any */
 	/* the quick actions first, each into a texture of its own */
-	for (int i = 0; i < 8 && !g_dump_dir; i++) {
+	for (int i = 0; i < shade_tiles(server) && !g_dump_dir; i++) {
 		double x, y, w, h;
 		shade_tile_rect(server, i, &x, &y, &w, &h);
 		cairo_t *tile_cr;
@@ -4959,10 +5014,27 @@ static void draw_shade(struct zt_server *server) {
 	cairo_t *cr;
 	struct zt_buffer *buffer = zt_buffer_create(server, server->width, height, &cr);
 	cairo_set_source_rgb(cr, 0, 0, 0);
-	cairo_paint(cr);
-	status_row(server, cr, true, false);
+	cairo_rectangle(cr, 0, 0, server->width, STATUS_H);
+	cairo_fill(cr);
+	cairo_set_source_rgb(cr, SHADE_BG, SHADE_BG, SHADE_BG);
+	cairo_rectangle(cr, 0, STATUS_H, server->width, height - STATUS_H);
+	cairo_fill(cr);
+	status_row(server, cr, false, false);
+	/* under the status bar: the date, and Expand or Collapse on the right */
+	{
+		char date[48];
+		time_t now = time(NULL);
+		struct tm tm;
+		localtime_r(&now, &tm);
+		strftime(date, sizeof(date), "%A, %B %-d", &tm);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		draw_text(cr, date, FONT_REGULAR, 12, SHADE_SIDE + 8, STATUS_H + 2, server->width / 2.0, 0, false);
+		const char *more = server->shade_collapsed ? "Expand" : "Collapse";
+		draw_text(cr, more, FONT_REGULAR, 12,
+			server->width - SHADE_SIDE - 8 - text_width(more, FONT_REGULAR, 12), STATUS_H + 2, 0, 0, false);
+	}
 	/* rendering to a file has no quads to put them on: draw them in place */
-	for (int i = 0; i < 8 && g_dump_dir; i++) {
+	for (int i = 0; i < shade_tiles(server) && g_dump_dir; i++) {
 		double x, y, w, h;
 		shade_tile_rect(server, i, &x, &y, &w, &h);
 		cairo_save(cr);
@@ -4971,21 +5043,22 @@ static void draw_shade(struct zt_server *server) {
 		cairo_restore(cr);
 	}
 
+	/* Windows 10 Mobile: "Clear all" on the right, under the quick actions
+	 * (All settings is a quick action of its own) */
 	double links = shade_links_y(server);
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	draw_icon(cr, "close", 14 + 5, links + 7, 10);
-	draw_text(cr, "CLEAR ALL", FONT_SEMIBOLD, 10, 14 + 18, links, 0, 0, false);
-	double settings_w = text_width("ALL SETTINGS", FONT_SEMIBOLD, 10);
-	draw_text(cr, "ALL SETTINGS", FONT_SEMIBOLD, 10, server->width - 14 - settings_w, links, 0, 0, false);
-	draw_icon(cr, "gear", server->width - 14 - settings_w - 12, links + 7, 12);
+	if (server->n_notes > 0) {
+		draw_text(cr, "Clear all", FONT_REGULAR, 13,
+			server->width - 14 - text_width("Clear all", FONT_REGULAR, 13), links, 0, 0, false);
+	}
 
 	/* What has been reported (`notify` on the control pipe), as the phone's
 	 * action centre lists it: under each app's name the notifications from
 	 * it, newest first, a title with the time beside it and a line of the
 	 * text under it. A tap opens one to all of its text, and shuts it. */
 	if (server->n_notes == 0) {
-		cairo_set_source_rgb(cr, 1, 1, 1);
-		draw_text(cr, "No notifications", FONT_LIGHT, 21, 14, links + 44, 0, 0, false);
+		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+		draw_text(cr, "No new notifications", FONT_REGULAR, 14, 14, links + 30, 0, 0, false);
 	}
 	double note_y = links + 46, bottom = height - SHADE_HANDLE - 4;
 	bool listed[MAX_NOTES] = { false };
@@ -5005,13 +5078,14 @@ static void draw_shade(struct zt_server *server) {
 		/* the app: a square in the accent colour with its initial, and its name */
 		const char *app = server->notes[first].app;
 		char initial[2] = { (char)toupper((unsigned char)app[0]), 0 };
+		/* (Windows 10 Mobile: a small square and the name small beside it) */
 		set_rgb(cr, server->accent);
-		cairo_rectangle(cr, 14, note_y, 28, 28);
+		cairo_rectangle(cr, 14, note_y, 20, 20);
 		cairo_fill(cr);
 		cairo_set_source_rgb(cr, 1, 1, 1);
-		draw_text(cr, initial, FONT_SEMIBOLD, 17, 14, note_y, 28, 28, true);
-		draw_text(cr, app, FONT_SEMILIGHT, 22, 52, note_y - 2, server->width - 66, 0, false);
-		note_y += 40;
+		draw_text(cr, initial, FONT_SEMIBOLD, 11, 14, note_y, 20, 20, true);
+		draw_text(cr, app, FONT_REGULAR, 13, 42, note_y + 1, server->width - 56, 0, false);
+		note_y += 30;
 		for (int i = first; i < server->n_notes && note_y < bottom; i++) {
 			if (listed[i] || strcmp(server->notes[i].app, app) != 0) {
 				continue;
@@ -5024,7 +5098,7 @@ static void draw_shade(struct zt_server *server) {
 			double when_w = text_width(when, FONT_REGULAR, 13.5);
 			server->notes[i].y0 = (float)(note_y - 4);
 			cairo_set_source_rgb(cr, 1, 1, 1);
-			draw_text(cr, server->notes[i].title, FONT_SEMIBOLD, 14.5, 14, note_y,
+			draw_text(cr, server->notes[i].title, FONT_SEMIBOLD, 13.5, 14, note_y,
 				server->width - 28 - when_w - 12, 0, false);
 			draw_text(cr, when, FONT_REGULAR, 13.5, server->width - 14 - when_w, note_y + 1, 0, 0, false);
 			note_y += 21;
@@ -5057,12 +5131,12 @@ static void draw_shade(struct zt_server *server) {
 	}
 	cairo_restore(cr);
 
-	/* the bar it is pushed back up by */
-	set_rgb(cr, server->accent);
+	/* the bar it is pushed back up by: a grip on a slightly lighter grey */
+	cairo_set_source_rgb(cr, SHADE_BG + 0.06, SHADE_BG + 0.06, SHADE_BG + 0.06);
 	cairo_rectangle(cr, 0, height - SHADE_HANDLE, server->width, SHADE_HANDLE);
 	cairo_fill(cr);
-	cairo_set_source_rgb(cr, 1, 1, 1);
-	cairo_rectangle(cr, server->width / 2.0 - 14, height - SHADE_HANDLE / 2.0 - 1.5, 28, 3);
+	cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
+	cairo_rectangle(cr, server->width / 2.0 - 14, height - SHADE_HANDLE / 2.0 - 1, 28, 2);
 	cairo_fill(cr);
 
 	zt_buffer_show(server, &server->shade_layer, buffer, cr, server->width, height);
@@ -5334,7 +5408,7 @@ static int boot_check_sensorhub(void *data) {
 	}
 
 	uint32_t elapsed = now_ms() - server->boot_wait_started_ms;
-	bool android_ready = access("/run/ztos-waydroid-boot-ready", F_OK) == 0;
+	bool android_ready = g_preview_w || access("/run/ztos-waydroid-boot-ready", F_OK) == 0;
 	if ((android_ready && (sensor_ready || server->sensorhub_fail_screen)) || elapsed >= 45000) {
 		if (android_ready && sensor_ready) {
 			wlr_log(WLR_INFO, "boot: sensor hub and Waydroid ready, starting transition");
@@ -6359,6 +6433,9 @@ static void launch_cmd(struct zt_server *server, const char *cmd) {
 
 /* Start a helper and do not wait for it: nothing here may block a frame. */
 static void run_detached(const char *program, const char *a1, const char *a2, const char *a3) {
+	if (g_preview_w) {
+		return;	/* the session on the screen runs the phone's helpers, not a preview */
+	}
 	pid_t pid = fork();
 	if (pid == 0) {
 		setsid();
@@ -6486,14 +6563,16 @@ static void shade_activate(struct zt_server *server, int index) {
 		shade_set_open(server, false);
 		launch_cmd(server, "ztsettings");
 		break;
-	case 8: /* CLEAR ALL */
+	case 8: /* Clear all */
 		server->n_notes = 0;
 		draw_shade(server);
 		damage(server);
 		break;
-	case 9: /* ALL SETTINGS */
-		shade_set_open(server, false);
-		launch_cmd(server, "ztsettings");
+	case 11: /* Expand / Collapse */
+		hap(server, HAP_TAP, HG_SYSTEM);
+		server->shade_collapsed = !server->shade_collapsed;
+		draw_shade(server);
+		damage(server);
 		break;
 	case 10: /* the bar along the bottom */
 		shade_set_open(server, false);
@@ -8095,6 +8174,9 @@ static int long_press_fired(void *data) {
 }
 
 static void pipe_tell(const char *path, const char *command) {
+	if (g_preview_w) {
+		return;
+	}
 	int fd = open(path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
 	if (fd >= 0) {
 		if (write(fd, command, strlen(command)) < 0) {
@@ -8577,7 +8659,7 @@ static void tone_rgb(int kelvin, float rgb[3]) {
 /* Switch the display itself off or on. Off, nothing is drawn and no frames
  * are scheduled; the power key brings it back. */
 static void screen_set(struct zt_server *server, bool on) {
-	if (!server->output || server->screen_on == on) {
+	if (!server->output || server->screen_on == on || g_preview_w) {
 		return;
 	}
 	if (!on && server->auth_active) auth_finish(server);
@@ -8984,13 +9066,9 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 		if (coasting) {
 			return;
 		}
-		if (p->on_list && !server->searching &&
-				hypot(x - SEARCH_X, y - (SEARCH_BOX_Y + ROUND / 2.0)) < ROUND) {
+		if (p->on_list && !server->searching && x >= LIST_LEFT && x < server->width - LIST_LEFT &&
+				y >= SEARCH_BOX_Y - 4 && y < SEARCH_BOX_Y + SEARCH_BOX_H + 4) {
 			p->badge = 4;	/* the search button */
-		} else if (!p->on_list && !server->editing && server->n_items > 0 &&
-				hypot(x - (server->width - 2 * round(server->width * 0.02) - ROUND / 2.0),
-					y - (server->arrow_y + STATUS_H - server->scroll + ROUND / 2.0)) < ROUND) {
-			p->badge = 3;	/* the arrow into the list */
 		} else if (p->on_list) {
 			p->index = item_at(server, x, y);
 			if (p->index >= 0) {
@@ -9410,10 +9488,7 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 			damage(server);
 		} else if (!cancelled && !p->moved) {
 			/* a tap */
-			if (p->badge == 3) {
-				hap(server, HAP_TAP, HG_NAV);
-				page_go(server, 1.0f, 0.0f);
-			} else if (p->badge == 4) {
+			if (p->badge == 4) {
 				hap(server, HAP_TAP, HG_NAV);
 				search_begin(server);
 			} else if (p->badge == 1) {
@@ -10533,6 +10608,9 @@ static void render_frame(struct zt_server *server) {
 	/* Start and the app list beside it, unless they have swung away completely */
 	if (server->start_t < 0.999f) {
 		float page_dx = -server->page * (float)server->width;
+		if (server->page < 0.999f) {
+			draw_wall(server, page_dx, 1.0f - server->start_t);
+		}
 		int n = server->page < 0.999f ? server->n_tiles : 0, draw_order[n > 0 ? n : 1];
 		float turns[n > 0 ? n : 1];
 		for (int i = 0; i < n; i++) {
@@ -10596,7 +10674,6 @@ static void render_frame(struct zt_server *server) {
 			mat_scale(m, t->press * grow, t->press * grow);
 			mat_translate(m, (float)(-t->w / 2), (float)(-t->h / 2));
 			mat_scale(m, (float)t->w, (float)t->h);
-			wall_under(server, m, t->x, t->y, t->w, t->h, alpha * dim);
 			quad(server, GL_TEXTURE_2D, face->tex, m, alpha * dim, true, false,
 				(float)face->pw / face->tw, (float)face->ph / face->th);
 			if (face == &t->back_layer) {
@@ -10617,23 +10694,6 @@ static void render_frame(struct zt_server *server) {
 				bx, cy + (float)t->h / 2 * grow - BADGE / 2.0f - 4, a);
 		}
 
-		if (server->n_items > 0 && server->round_arrow.tex && server->page < 0.999f &&
-				server->edit_t < 0.999f) {
-			/* the arrow into the app list, under the last tiles on the right */
-			float y = (float)(server->arrow_y + STATUS_H - server->scroll);
-			float x = (float)(server->width - 2 * round(server->width * 0.02)) - ROUND + page_dx;
-			if (y < server->height && y + ROUND > 0) {
-				float m[16];
-				float turn = turn_at(server, (float)((server->turn_bottom - server->arrow_y - ROUND) /
-					turn_pitch(server)), 0, true, false, false, 0, 0);
-				float alpha = turn_place(server, m, x, y, ROUND, ROUND, LIST_SPAN, turn, 0, false);
-				mat_translate(m, -ROUND / 2.0f, -ROUND / 2.0f);
-				mat_scale(m, ROUND, ROUND);
-				quad(server, GL_TEXTURE_2D, server->round_arrow.tex, m, alpha * (1.0f - server->edit_t), true,
-					false, (float)server->round_arrow.pw / server->round_arrow.tw,
-					(float)server->round_arrow.ph / server->round_arrow.th);
-			}
-		}
 		if (server->page > 0.001f) {
 			/* the app list: only the rows on the screen */
 			float lx = (float)list_margin(server) + (1.0f - server->page) * (float)server->width;
@@ -10668,8 +10728,7 @@ static void render_frame(struct zt_server *server) {
 				float turn = turn_at(server, search_rows_up, 0.5f, true, false, false, 0, 0);
 				float m[16];
 				struct zt_layer *l = server->searching ? &server->search_layer : &server->round_search;
-				float x = server->searching ? 16.0f + (1.0f - server->page) * (float)server->width :
-					lx - (float)LIST_LEFT + SEARCH_X - ROUND / 2.0f;
+				float x = lx;
 				float yy = (float)SEARCH_BOX_Y;
 				if (l->tex && yy + l->h > STATUS_H) {
 					float alpha = turn_place(server, m, x, yy, (float)l->w, (float)l->h, LIST_SPAN, turn,
@@ -10788,11 +10847,12 @@ static void render_frame(struct zt_server *server) {
 		/* the frame buffer's first row is the top of the screen */
 		glScissor(0, 0, px_w, px_cover);
 		layer_draw(server, &server->shade_layer, 0, 0, 1.0f);
-		if (server->shade_row && server->peek_layer.tex) {
-			layer_draw(server, &server->peek_layer, 0, 0, 1.0f);
+		if (server->shade_row && server->status_layer.tex) {
+			/* (only the bar itself: the panel draws its own line under it) */
+			layer_draw(server, &server->status_layer, 0, 0, 1.0f);
 		}
 		plug_over(server, 0.0f);
-		for (int i = 0; i < 8; i++) {
+		for (int i = 0; i < shade_tiles(server); i++) {
 			struct zt_layer *layer = &server->shade_tile_layer[i];
 			double x, y, w, h;
 			shade_tile_rect(server, i, &x, &y, &w, &h);
@@ -11074,7 +11134,12 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	wlr_output_state_init(&state);
 	wlr_output_state_set_enabled(&state, true);
 	struct wlr_output_mode *mode = wlr_output_preferred_mode(wlr_output);
-	if (mode) {
+	if (g_preview_w) {
+		wlr_output_state_set_custom_mode(&state, g_preview_w, g_preview_h, 60000);
+		if (server->scale <= 0.0f) {
+			server->scale = g_preview_w / 360.0f;
+		}
+	} else if (mode) {
 		wlr_output_state_set_mode(&state, mode);
 	}
 	/* Every phone is 360 points across, as Windows Phone was: 4 pixels a
@@ -11423,9 +11488,25 @@ int main(int argc, char *argv[]) {
 	 * Linear it is a plain copy, and the GPU barely notices on our few quads. */
 	setenv("PAN_MESA_DEBUG", "noafbc,linear", true);
 
+	const char *preview = getenv("ZTMETRO_PREVIEW");
+	if (preview && sscanf(preview, "%dx%d", &g_preview_w, &g_preview_h) == 2 &&
+			g_preview_w > 0 && g_preview_h > 0) {
+		setenv("WLR_BACKENDS", "headless", true);
+		setenv("WLR_HEADLESS_OUTPUTS", "1", true);
+		/* ZTMETRO_WALL=photo: Start's, as a theme would set it */
+		const char *wall = getenv("ZTMETRO_WALL");
+		if (wall) {
+			snprintf(server.start_wall_path, sizeof(server.start_wall_path), "%s", wall);
+		}
+	} else {
+		g_preview_w = g_preview_h = 0;
+	}
+
 	server.wl_display = wl_display_create();
 	server.loop = wl_display_get_event_loop(server.wl_display);
-	backlight_init(&server);
+	if (!g_preview_w) {
+		backlight_init(&server);
+	}
 	backlight_set(server.shade_brightness);	/* (load_config ran before the loop) */
 	server.backend = wlr_backend_autocreate(server.loop, NULL);
 	if (!server.backend) {

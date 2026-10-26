@@ -330,17 +330,30 @@ void zmc_add_hit(double x, double y, double w, double h, int action, int arg) {
 }
 
 /*
- * The header every page shares. Metrics are measured off a screenshot of the
- * phone's settings hub and scaled to a 360 point wide screen: the small caps
- * line 14 points down, the page title in 48 point Semilight under it, the first
- * entry 108 points down. A pivot's title is followed by the next one in grey,
- * running off the edge.
+ * The header every page shares, as Windows 10 Mobile has it: the app's name
+ * in small caps 12 points down, the page title under it in 28 point
+ * Semilight (8.1's was 48), the first entry 80 points down. A pivot's title
+ * is followed by the next one in grey, running off the edge.
  */
+/* Windows Phone 8.1 wrote its titles in lower case ("display"); Windows 10
+ * Mobile in sentence case ("Display"). The apps keep 8.1's words and the
+ * header and the hub entries give them their capital here. */
+static const char *sentence(const char *text, char *out, size_t size) {
+	snprintf(out, size, "%s", text ? text : "");
+	if (out[0] >= 'a' && out[0] <= 'z') {
+		out[0] = (char)(out[0] - 'a' + 'A');
+	}
+	return out;
+}
+
+#define TITLE_PT	28
+#define TITLE_Y		28
+#define TITLE_GAP	14	/* between a pivot's titles */
 /* How wide a pivot title is, set in the title face. */
 static int pivot_title_width(cairo_t *cr, const char *text) {
 	PangoLayout *layout = steady_layout(cr);
 	PangoFontDescription *desc = pango_font_description_from_string(FONT_SEMILIGHT);
-	pango_font_description_set_absolute_size(desc, 48 * PANGO_SCALE);
+	pango_font_description_set_absolute_size(desc, TITLE_PT * PANGO_SCALE);
 	pango_layout_set_font_description(layout, desc);
 	pango_layout_set_text(layout, text, -1);
 	int w, h;
@@ -350,32 +363,35 @@ static int pivot_title_width(cairo_t *cr, const char *text) {
 	return w;
 }
 
-double zmc_pivot_next(cairo_t *cr, const char *title, const char *next, int action, int arg) {
+double zmc_pivot_next(cairo_t *cr, const char *title_raw, const char *next_raw, int action, int arg) {
+	char title_buf[128], next_buf[128];
+	const char *title = sentence(title_raw, title_buf, sizeof(title_buf));
+	const char *next = next_raw ? sentence(next_raw, next_buf, sizeof(next_buf)) : NULL;
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text(cr, zmc.app->caps, FONT_SEMIBOLD, 11.5, MARGIN, 14, 0);
-	zmc_text(cr, title, FONT_SEMILIGHT, 48, MARGIN - 3, 24, 0);
+	zmc_text(cr, zmc.app->caps, FONT_SEMIBOLD, 11.5, MARGIN, 12, 0);
+	zmc_text(cr, title, FONT_SEMILIGHT, TITLE_PT, MARGIN - 1, TITLE_Y, 0);
 	if (next) {
 		int w = pivot_title_width(cr, title);
 		cairo_set_source_rgb(cr, 0.38, 0.38, 0.38);
-		zmc_text(cr, next, FONT_SEMILIGHT, 48, MARGIN - 3 + w + 16, 24, 0);
+		zmc_text(cr, next, FONT_SEMILIGHT, TITLE_PT, MARGIN - 1 + w + TITLE_GAP, TITLE_Y, 0);
 		/* The tabs go round: after the next title comes this one again, as it
 		 * does while the tabs move. Drawn at rest too, or two short titles
 		 * show a third one that was not there a moment ago, popping in at the
 		 * edge as soon as a finger moves them. */
-		zmc_text(cr, title, FONT_SEMILIGHT, 48,
-			MARGIN - 3 + w + 16 + pivot_title_width(cr, next) + 16, 24, 0);
+		zmc_text(cr, title, FONT_SEMILIGHT, TITLE_PT,
+			MARGIN - 1 + w + TITLE_GAP + pivot_title_width(cr, next) + TITLE_GAP, TITLE_Y, 0);
 		if (action) {
 			/* the next tab, to its right edge of the screen: before the
 			 * title's own hit, which would otherwise take the tap. It
 			 * slides across, as a swipe would. */
-			zmc_add_hit(MARGIN + w + 8, 0, zmc.width - (MARGIN + w + 8), 90, ZMC_ACT_PIVOT, arg);
+			zmc_add_hit(MARGIN + w + 6, 0, zmc.width - (MARGIN + w + 6), 70, ZMC_ACT_PIVOT, arg);
 			zmc.pivot_set = true;
 			zmc.pivot_page = arg;
-			zmc.pivot_next_dx = w + 16;
+			zmc.pivot_next_dx = w + TITLE_GAP;
 		}
 	}
-	zmc_add_hit(0, 0, zmc.width, 90, ZMC_ACT_BACK, 0);
-	return 108;
+	zmc_add_hit(0, 0, zmc.width, 70, ZMC_ACT_BACK, 0);
+	return 84;
 }
 
 double zmc_pivot(cairo_t *cr, const char *title, const char *next) {
@@ -386,44 +402,73 @@ double zmc_header(cairo_t *cr, const char *title) {
 	return zmc_pivot(cr, title, NULL);
 }
 
-/* A hub entry: a 25.5 point title, a 12 point grey line under it, 59 points
- * from one entry to the next, and nothing drawn between them. */
+/* A hub entry, as Windows 10 Mobile's Settings lists them: a 16 point
+ * title, a 12 point grey line under it, 56 points from one entry to the
+ * next, and nothing drawn between them. */
 double zmc_entry(cairo_t *cr, double y, const char *title, const char *detail,
 		int action, int arg) {
+	char title_buf[128];
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text(cr, title, FONT_SEMILIGHT, 25.5, MARGIN, y, 0);
+	zmc_text(cr, sentence(title, title_buf, sizeof(title_buf)), FONT_REGULAR, 16, MARGIN, y, 0);
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	zmc_text(cr, detail, FONT_REGULAR, 12, MARGIN, y + 31, 0);
-	zmc_add_hit(0, y - 2, zmc.width, 57, action, arg);
-	return y + 59;
+	zmc_text(cr, detail, FONT_REGULAR, 12, MARGIN, y + 22, 0);
+	zmc_add_hit(0, y - 6, zmc.width, 52, action, arg);
+	return y + 56;
 }
 
-void zmc_toggle(cairo_t *cr, double x, double y, bool on) {
+/* Windows 10's hub entry: an icon in a 24 by 24 box at the left and the
+ * title and detail after it. `icon` draws into the box, at (x, y). */
+double zmc_entry_icon(cairo_t *cr, double y, void (*icon)(cairo_t *, double, double),
+		const char *title, const char *detail, int action, int arg) {
+	char title_buf[128];
+	cairo_save(cr);
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	cairo_set_line_width(cr, 2);
-	cairo_rectangle(cr, x + 1, y + 1, 52, 22);
-	cairo_stroke(cr);
+	cairo_set_line_width(cr, 1.5);
+	cairo_new_path(cr);	/* the text before leaves its current point */
+	icon(cr, MARGIN, y + 6);
+	cairo_restore(cr);
+	cairo_new_path(cr);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_text(cr, sentence(title, title_buf, sizeof(title_buf)), FONT_REGULAR, 16, MARGIN + 40, y, 0);
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	zmc_text_line(cr, detail, FONT_REGULAR, 12, MARGIN + 40, y + 22, zmc.width - MARGIN - 40 - 8);
+	zmc_add_hit(0, y - 6, zmc.width, 52, action, arg);
+	return y + 56;
+}
+
+/* Windows 10's toggle switch: a pill 44 by 20, an outline with a white knob
+ * at the left when off, filled with the accent and the knob at the right when
+ * on. Its left edge at x. */
+static void toggle_pill(cairo_t *cr, double x, double y, bool on) {
+	const double w = 44, h = 20, r = h / 2;
+	cairo_new_path(cr);
+	cairo_arc(cr, x + r, y + r, r - 1, M_PI / 2, 3 * M_PI / 2);
+	cairo_arc(cr, x + w - r, y + r, r - 1, -M_PI / 2, M_PI / 2);
+	cairo_close_path(cr);
 	if (on) {
 		zmc_set_rgb(cr, zmc.accent);
+		cairo_fill(cr);
 	} else {
-		cairo_set_source_rgb(cr, 0.2, 0.2, 0.2);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		cairo_set_line_width(cr, 2);
+		cairo_stroke(cr);
 	}
-	cairo_rectangle(cr, x + 4, y + 4, 46, 16);
-	cairo_fill(cr);
-
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	if (on) {
-		cairo_rectangle(cr, x + 41, y - 1, 12, 26);
-	} else {
-		cairo_rectangle(cr, x + 1, y - 1, 12, 26);
-	}
+	cairo_new_path(cr);
+	cairo_arc(cr, on ? x + w - r : x + r, y + r, 5, 0, 2 * M_PI);
 	cairo_fill(cr);
 }
 
+/* (in the 54 by 24 box 8.1's toggle took: at its right) */
+void zmc_toggle(cairo_t *cr, double x, double y, bool on) {
+	toggle_pill(cr, x + 10, y + 2, on);
+}
+
+#define SLIDER_TRACK_DY	34	/* the track, under the caption's top */
 void zmc_slider(cairo_t *cr, double x, double y, double w, int percent, const char *caption,
 		int action) {
 	if (zmc.n_hits < MAX_HITS) {
-		zmc.hits[zmc.n_hits++] = (struct zmc_hit){ x, y, w, 46, action, 0, true };
+		zmc.hits[zmc.n_hits++] = (struct zmc_hit){ x, y, w, 52, action, 0, true };
 	}
 	if (caption) {
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
@@ -432,20 +477,20 @@ void zmc_slider(cairo_t *cr, double x, double y, double w, int percent, const ch
 	char pct_str[16];
 	snprintf(pct_str, sizeof(pct_str), "%d%%", percent);
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text(cr, pct_str, FONT_SEMIBOLD, 14, x + w - 42, y, 0);
+	zmc_text(cr, pct_str, FONT_REGULAR, 14, x + w - 42, y, 0);
 
-	double track_y = y + 24;
-	cairo_set_source_rgb(cr, 0.22, 0.22, 0.22);
-	cairo_rectangle(cr, x, track_y, w, 4);
+	/* Windows 10's slider: a 2 point track, grey, the accent up to the
+	 * value, and a thumb of the accent 8 by 24 standing on it */
+	double track_y = y + SLIDER_TRACK_DY;
+	cairo_set_source_rgb(cr, 0.45, 0.45, 0.45);
+	cairo_rectangle(cr, x, track_y, w, 2);
 	cairo_fill(cr);
 
 	double fill_w = w * (percent / 100.0);
 	zmc_set_rgb(cr, zmc.accent);
-	cairo_rectangle(cr, x, track_y, fill_w, 4);
+	cairo_rectangle(cr, x, track_y, fill_w, 2);
 	cairo_fill(cr);
-
-	cairo_set_source_rgb(cr, 1, 1, 1);
-	cairo_rectangle(cr, x + fill_w - 5, track_y - 7, 10, 18);
+	cairo_rectangle(cr, x + fill_w - 4, track_y - 11, 8, 24);
 	cairo_fill(cr);
 }
 
@@ -945,7 +990,7 @@ static void draw_press(cairo_t *cr, int scale) {
 #define PIVOT_LIGHT	60.0	/* and over which its title lights up */
 #define PIVOT_FLICK	0.3	/* or this fast, points per ms */
 #define PIVOT_SPRING_W	0.018	/* per ms: in place in about a quarter second */
-#define CAPS_H		32	/* includes Segoe UI caps descenders; stays fixed during pivots */
+#define CAPS_H		30	/* the app's name, with its descenders; stays fixed during pivots */
 
 /* A page drawn whole with nothing behind it (so that two can lie over each
  * other), at `scale`, scrolled by `scroll`; its rows into `rows`. What the
@@ -2266,11 +2311,11 @@ static void draw_slider_live(double s) {
 	}
 	float r = ((zmc.accent >> 16) & 255) / 255.0f;
 	float g = ((zmc.accent >> 8) & 255) / 255.0f, b = (zmc.accent & 255) / 255.0f;
-	double track = y + 24, fill = h->w * slider_live / 100.0;
-	zmg_rect(h->x - 6, track - 8, h->w + 12, 20, 0, 0, 0);	/* the old thumb and fill */
-	zmg_rect(h->x, track, h->w, 4, 0.22f, 0.22f, 0.22f);
-	zmg_rect(h->x, track, fill, 4, r, g, b);
-	zmg_rect(h->x + fill - 5, track - 7, 10, 18, 1, 1, 1);
+	double track = y + SLIDER_TRACK_DY, fill = h->w * slider_live / 100.0;
+	zmg_rect(h->x - 6, track - 12, h->w + 12, 26, 0, 0, 0);	/* the old thumb and fill */
+	zmg_rect(h->x, track, h->w, 2, 0.45f, 0.45f, 0.45f);
+	zmg_rect(h->x, track, fill, 2, r, g, b);
+	zmg_rect(h->x + fill - 4, track - 11, 8, 24, r, g, b);
 	/* the percentage, where zmc_slider writes it */
 	digits_ensure((int)s);
 	double x = h->x + h->w - 42;
@@ -2354,13 +2399,15 @@ void zmc_back(void) {
 	}
 }
 
+/* Windows 10's toggle switch with its header: the title over the switch,
+ * and On or Off beside it. */
 double zmc_switch(cairo_t *cr, double y, const char *title, bool on, int action) {
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text(cr, title, FONT_SEMILIGHT, 21, MARGIN, y, zmc.width - 2 * MARGIN - 64);
-	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	zmc_text(cr, on ? "On" : "Off", FONT_REGULAR, 13, MARGIN, y + 26, 0);
-	zmc_toggle(cr, zmc.width - MARGIN - 54, y + 4, on);
-	zmc_add_hit(0, y - 4, zmc.width, 52, action, 0);
+	zmc_text(cr, title, FONT_REGULAR, 15, MARGIN, y, zmc.width - 2 * MARGIN);
+	toggle_pill(cr, MARGIN, y + 26, on);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_text(cr, on ? "On" : "Off", FONT_REGULAR, 15, MARGIN + 56, y + 24, 0);
+	zmc_add_hit(0, y - 4, zmc.width, 56, action, 0);
 	return y + 66;
 }
 
@@ -2374,18 +2421,31 @@ double zmc_textbox(cairo_t *cr, double y, const char *caption, const char *value
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, caption, FONT_REGULAR, 13, MARGIN, y, 0);
 	y += 22;
-	/* the box: white with black text while it is being typed into */
+	/* Windows 10's text box: dark with a grey border at rest; white with
+	 * black text and an accent border while it is being typed into */
 	if (focused) {
 		cairo_set_source_rgb(cr, 1, 1, 1);
 	} else {
-		cairo_set_source_rgb(cr, 0.78, 0.78, 0.78);
+		cairo_set_source_rgb(cr, 0.08, 0.08, 0.08);
 	}
 	cairo_rectangle(cr, MARGIN, y, w, h);
 	cairo_fill(cr);
-	cairo_set_source_rgb(cr, 0, 0, 0);
+	if (focused) {
+		zmc_set_rgb(cr, zmc.accent);
+	} else {
+		cairo_set_source_rgb(cr, 0.55, 0.55, 0.55);
+	}
+	cairo_set_line_width(cr, 2);
+	cairo_rectangle(cr, MARGIN + 1, y + 1, w - 2, h - 2);
+	cairo_stroke(cr);
+	if (focused) {
+		cairo_set_source_rgb(cr, 0, 0, 0);
+	} else {
+		cairo_set_source_rgb(cr, 1, 1, 1);
+	}
 	char shown[160];
 	snprintf(shown, sizeof(shown), "%s%s", value, focused ? "|" : "");
-	zmc_text(cr, shown, FONT_REGULAR, 17, MARGIN + 8, y + 8, 0);
+	zmc_text(cr, shown, FONT_REGULAR, 16, MARGIN + 9, y + 9, 0);
 	zmc_add_hit(0, y - 24, zmc.width, h + 30, action, arg);
 	if (focused && osk_wanted) {
 		/* where this box ends in the window: the shell lifts the app over the keyboard by it */
@@ -2707,22 +2767,18 @@ bool zmc_transition(const char *name, double t, double x, double y, double w, do
 }
 
 double zmc_button(cairo_t *cr, double x, double y, double w, const char *label, int action, int arg) {
-	const double h = 40, line = 2;
+	/* Windows 10's button: a grey block, no outline; held, a lighter one */
+	const double h = 36;
 	bool down = zmc.button_down && zmc.pressed.action == action && zmc.pressed.arg == arg &&
 		zmc.pressed.button;
 	cairo_save(cr);
 	cairo_new_path(cr);
+	double grey = down ? 0.42 : 0.24;
+	cairo_set_source_rgb(cr, grey, grey, grey);
+	cairo_rectangle(cr, x, y, w, h);
+	cairo_fill(cr);
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	if (down) {
-		cairo_rectangle(cr, x, y, w, h);
-		cairo_fill(cr);
-		cairo_set_source_rgb(cr, 0, 0, 0);
-	} else {
-		cairo_set_line_width(cr, line);
-		cairo_rectangle(cr, x + line / 2, y + line / 2, w - line, h - line);
-		cairo_stroke(cr);
-	}
-	zmc_text_centred(cr, label, FONT_SEMIBOLD, 14.5, x + w / 2, y + 10);
+	zmc_text_centred(cr, label, FONT_REGULAR, 15, x + w / 2, y + 8);
 	cairo_restore(cr);
 	if (zmc.n_hits < MAX_HITS) {
 		zmc.hits[zmc.n_hits++] = (struct zmc_hit){ x, y, w, h, action, arg, false, true };
@@ -2732,12 +2788,11 @@ double zmc_button(cairo_t *cr, double x, double y, double w, const char *label, 
 
 void zmc_round_button(cairo_t *cr, double cx, double y, const char *glyph, const char *label,
 		int action, int arg) {
+	/* Windows 10 Mobile's app bar: the glyph alone, without 8.1's ring */
 	const double d = 44;
 	cairo_save(cr);
 	cairo_set_line_width(cr, 2.2);
-	cairo_new_path(cr);	/* (text leaves a current point: the ring would be joined to it) */
-	cairo_arc(cr, cx, y + d / 2, d / 2 - 1.1, 0, 2 * M_PI);
-	cairo_stroke(cr);
+	cairo_new_path(cr);	/* (text leaves a current point: the glyph would be joined to it) */
 	cairo_translate(cr, cx, y + d / 2);
 	round_glyph(cr, glyph);
 	cairo_restore(cr);
@@ -2759,12 +2814,13 @@ void zmc_menu(cairo_t *cr, double y, const char *const *items, int count, int ac
 	if (y + h > zmc.scroll + zmc.height - 8) {
 		y = zmc.scroll + zmc.height - 8 - h;	/* all of it on the screen */
 	}
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	/* Windows 10's menu flyout: a dark grey panel, the items in white */
+	cairo_set_source_rgb(cr, 0.17, 0.17, 0.17);
 	cairo_rectangle(cr, 0, y, zmc.width, h);
 	cairo_fill(cr);
-	cairo_set_source_rgb(cr, 0, 0, 0);
+	cairo_set_source_rgb(cr, 1, 1, 1);
 	for (int i = 0; i < count; i++) {
-		zmc_text(cr, items[i], FONT_SEMILIGHT, 24, MARGIN, y + 8 + i * row + 8, zmc.width - 2 * MARGIN);
+		zmc_text(cr, items[i], FONT_REGULAR, 16, MARGIN, y + 8 + i * row + 13, zmc.width - 2 * MARGIN);
 		zmc_add_hit(0, y + 8 + i * row, zmc.width, row, action, i);
 	}
 	/* (the first hit under a point is the one taken: the items, then the rest) */
@@ -2780,11 +2836,21 @@ double zmc_field(cairo_t *cr, double y, const char *caption, const char *value) 
 
 double zmc_choice(cairo_t *cr, double y, const char *title, const char *value, int action) {
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text(cr, title, FONT_SEMILIGHT, 20, MARGIN, y, 0);
-	zmc_accent(cr);
-	zmc_text(cr, value, FONT_REGULAR, 15, MARGIN, y + 26, 0);
-	zmc_add_hit(0, y - 4, zmc.width, 52, action, 0);
-	return y + 68;
+	zmc_text(cr, title, FONT_REGULAR, 16, MARGIN, y, 0);
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	zmc_text(cr, value, FONT_REGULAR, 12, MARGIN, y + 22, 0);
+	zmc_add_hit(0, y - 6, zmc.width, 52, action, 0);
+	return y + 56;
+}
+
+/* the combo box's arrow, pointing down, its middle at (x, y) */
+static void chevron_down(cairo_t *cr, double x, double y) {
+	cairo_new_path(cr);
+	cairo_set_line_width(cr, 1.5);
+	cairo_move_to(cr, x - 5, y - 2.5);
+	cairo_line_to(cr, x, y + 2.5);
+	cairo_line_to(cr, x + 5, y - 2.5);
+	cairo_stroke(cr);
 }
 
 /* A list picker opens in place, as Windows Phone's does: the box grows from
@@ -2827,18 +2893,23 @@ double zmc_picker(cairo_t *cr, double y, const char *caption, const char *const 
 	if (p > 0.001 && p < 0.999) {
 		zmc.picker_until = now + 100;
 	}
-	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	cairo_set_source_rgb(cr, 1, 1, 1);
 	zmc_text(cr, caption, FONT_REGULAR, 15, x, y, w);
 	y += 24;
 	double h = row + ((count - 1) * row + 8) * p;
-	/* the box: an outline closed, the edit background open */
-	cairo_set_source_rgba(cr, 1, 1, 1, p);
+	/* Windows 10's combo box: a grey outline with the value and an arrow;
+	 * open, a dark grey list with the chosen one on the accent */
+	cairo_set_source_rgba(cr, 0.17, 0.17, 0.17, p);
 	cairo_rectangle(cr, x, y, w, h);
 	cairo_fill(cr);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	cairo_set_source_rgb(cr, 0.55, 0.55, 0.55);
 	cairo_set_line_width(cr, 2);
 	cairo_rectangle(cr, x + 1, y + 1, w - 2, h - 2);
 	cairo_stroke(cr);
+	if (p < 0.999) {
+		cairo_set_source_rgba(cr, 1, 1, 1, 1 - p);
+		chevron_down(cr, x + w - 16, y + row / 2);
+	}
 	cairo_save(cr);
 	cairo_rectangle(cr, x, y, w, h);
 	cairo_clip(cr);
@@ -2846,17 +2917,24 @@ double zmc_picker(cairo_t *cr, double y, const char *caption, const char *const 
 		/* each option slides from where the chosen one sits to its own place */
 		double top = y + 4 * p + i * row * p;
 		if (i == selected) {
-			double r, g, b;
-			zmc_accent(cr);
-			cairo_pattern_get_rgba(cairo_get_source(cr), &r, &g, &b, NULL);
-			cairo_set_source_rgb(cr, 1 + (r - 1) * p, 1 + (g - 1) * p, 1 + (b - 1) * p);
+			if (p > 0.001) {
+				cairo_save(cr);
+				zmc_accent(cr);
+				double r, g, b;
+				cairo_pattern_get_rgba(cairo_get_source(cr), &r, &g, &b, NULL);
+				cairo_set_source_rgba(cr, r, g, b, p);
+				cairo_rectangle(cr, x + 2, top, w - 4, row);
+				cairo_fill(cr);
+				cairo_restore(cr);
+			}
+			cairo_set_source_rgb(cr, 1, 1, 1);
 		} else {
 			if (p <= 0.001) {
 				continue;
 			}
-			cairo_set_source_rgba(cr, 0, 0, 0, p);
+			cairo_set_source_rgba(cr, 1, 1, 1, p);
 		}
-		zmc_text(cr, options[i], FONT_REGULAR, 17, x + 10, top + 9, w - 20);
+		zmc_text(cr, options[i], FONT_REGULAR, 15, x + 10, top + 10, w - 36);
 		if (p >= 0.999) {
 			zmc_add_hit(0, top, zmc.width, row, action, i);
 		}

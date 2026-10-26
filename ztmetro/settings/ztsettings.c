@@ -839,33 +839,257 @@ static void cell_load(void) {
 	app.mobile_data = cell.data_on;
 }
 
+/* Windows 10 Mobile's Settings hub draws a line glyph beside each entry
+ * (Segoe MDL2 Assets, which ztOS does not carry): the same ideas in cairo,
+ * each in a 24 by 24 box at (x, y), white, 1.5 wide */
+static void icon_theme(cairo_t *cr, double x, double y) {
+	/* a paintbrush: the handle and its tip */
+	cairo_move_to(cr, x + 20, y + 3);
+	cairo_line_to(cr, x + 10, y + 13);
+	cairo_stroke(cr);
+	cairo_move_to(cr, x + 9, y + 12);
+	cairo_curve_to(cr, x + 4, y + 12, x + 4, y + 18, x + 3, y + 21);
+	cairo_curve_to(cr, x + 7, y + 21, x + 12, y + 20, x + 12, y + 15);
+	cairo_close_path(cr);
+	cairo_stroke(cr);
+}
+
+static void icon_navigation(cairo_t *cr, double x, double y) {
+	/* a phone with its bar of three buttons */
+	cairo_rectangle(cr, x + 6, y + 1.5, 12, 21);
+	cairo_stroke(cr);
+	cairo_move_to(cr, x + 6, y + 17);
+	cairo_line_to(cr, x + 18, y + 17);
+	cairo_stroke(cr);
+	for (int i = 0; i < 3; i++) {
+		cairo_arc(cr, x + 8.5 + i * 3.5, y + 19.8, 0.9, 0, 2 * M_PI);
+		cairo_fill(cr);
+	}
+}
+
+static void icon_display(cairo_t *cr, double x, double y) {
+	/* the sun */
+	cairo_arc(cr, x + 12, y + 12, 4.5, 0, 2 * M_PI);
+	cairo_stroke(cr);
+	for (int i = 0; i < 8; i++) {
+		double a = i * M_PI / 4;
+		cairo_move_to(cr, x + 12 + 7.5 * cos(a), y + 12 + 7.5 * sin(a));
+		cairo_line_to(cr, x + 12 + 10.5 * cos(a), y + 12 + 10.5 * sin(a));
+	}
+	cairo_stroke(cr);
+}
+
+static void icon_wifi(cairo_t *cr, double x, double y) {
+	zmc_wifi_glyph(cr, x, y + 1, 24, 4);
+}
+
+static void icon_bluetooth(cairo_t *cr, double x, double y) {
+	/* the rune */
+	cairo_move_to(cr, x + 6, y + 7);
+	cairo_line_to(cr, x + 17, y + 17);
+	cairo_line_to(cr, x + 12, y + 22);
+	cairo_line_to(cr, x + 12, y + 2);
+	cairo_line_to(cr, x + 17, y + 7);
+	cairo_line_to(cr, x + 6, y + 17);
+	cairo_stroke(cr);
+}
+
+static void icon_cellular(cairo_t *cr, double x, double y) {
+	/* five bars, rising */
+	for (int i = 0; i < 5; i++) {
+		double h = 4 + i * 4.2;
+		cairo_rectangle(cr, x + 1.5 + i * 4.5, y + 22 - h, 2.5, h);
+	}
+	cairo_fill(cr);
+}
+
+static void icon_sounds(cairo_t *cr, double x, double y) {
+	/* a speaker and two waves */
+	cairo_move_to(cr, x + 2, y + 9);
+	cairo_line_to(cr, x + 6, y + 9);
+	cairo_line_to(cr, x + 11, y + 4);
+	cairo_line_to(cr, x + 11, y + 20);
+	cairo_line_to(cr, x + 6, y + 15);
+	cairo_line_to(cr, x + 2, y + 15);
+	cairo_close_path(cr);
+	cairo_stroke(cr);
+	cairo_arc(cr, x + 11, y + 12, 5, -M_PI / 4, M_PI / 4);
+	cairo_stroke(cr);
+	cairo_arc(cr, x + 11, y + 12, 9, -M_PI / 4, M_PI / 4);
+	cairo_stroke(cr);
+}
+
+static void icon_haptics(cairo_t *cr, double x, double y) {
+	/* a phone shaking */
+	cairo_rectangle(cr, x + 8, y + 3, 8, 18);
+	cairo_stroke(cr);
+	for (int side = -1; side <= 1; side += 2) {
+		double cx = x + 12 + side * 7.5;
+		cairo_move_to(cr, cx, y + 7);
+		cairo_line_to(cr, cx + side * 2, y + 10);
+		cairo_line_to(cr, cx, y + 13);
+		cairo_line_to(cr, cx + side * 2, y + 16);
+		cairo_stroke(cr);
+	}
+}
+
+static void icon_notifications(cairo_t *cr, double x, double y) {
+	/* the action centre's speech box, with its lines */
+	cairo_move_to(cr, x + 2, y + 3);
+	cairo_line_to(cr, x + 22, y + 3);
+	cairo_line_to(cr, x + 22, y + 17);
+	cairo_line_to(cr, x + 9, y + 17);
+	cairo_line_to(cr, x + 5, y + 21);
+	cairo_line_to(cr, x + 5, y + 17);
+	cairo_line_to(cr, x + 2, y + 17);
+	cairo_close_path(cr);
+	cairo_stroke(cr);
+	cairo_move_to(cr, x + 6, y + 8);
+	cairo_line_to(cr, x + 18, y + 8);
+	cairo_move_to(cr, x + 6, y + 12);
+	cairo_line_to(cr, x + 15, y + 12);
+	cairo_stroke(cr);
+}
+
+static void icon_battery(cairo_t *cr, double x, double y) {
+	cairo_rectangle(cr, x + 1.5, y + 7, 18, 10);
+	cairo_stroke(cr);
+	cairo_rectangle(cr, x + 20, y + 10, 2.5, 4);
+	cairo_fill(cr);
+	cairo_rectangle(cr, x + 3.5, y + 9, 8, 6);
+	cairo_fill(cr);
+}
+
+static void icon_processor(cairo_t *cr, double x, double y) {
+	/* a chip and its pins */
+	cairo_rectangle(cr, x + 6, y + 6, 12, 12);
+	cairo_stroke(cr);
+	cairo_rectangle(cr, x + 9.5, y + 9.5, 5, 5);
+	cairo_fill(cr);
+	for (int i = 0; i < 3; i++) {
+		double p = 8.5 + i * 3.5;
+		cairo_move_to(cr, x + p, y + 2);
+		cairo_line_to(cr, x + p, y + 6);
+		cairo_move_to(cr, x + p, y + 18);
+		cairo_line_to(cr, x + p, y + 22);
+		cairo_move_to(cr, x + 2, y + p);
+		cairo_line_to(cr, x + 6, y + p);
+		cairo_move_to(cr, x + 18, y + p);
+		cairo_line_to(cr, x + 22, y + p);
+	}
+	cairo_stroke(cr);
+}
+
+static void icon_memory(cairo_t *cr, double x, double y) {
+	/* a memory stick: the board, its chips, its contacts */
+	cairo_rectangle(cr, x + 1.5, y + 7, 21, 9);
+	cairo_stroke(cr);
+	for (int i = 0; i < 4; i++) {
+		cairo_rectangle(cr, x + 4 + i * 4.5, y + 9.5, 2.8, 4);
+	}
+	cairo_fill(cr);
+	for (int i = 0; i < 6; i++) {
+		cairo_move_to(cr, x + 3.5 + i * 3.4, y + 16);
+		cairo_line_to(cr, x + 3.5 + i * 3.4, y + 19);
+	}
+	cairo_stroke(cr);
+}
+
+static void icon_graphics(cairo_t *cr, double x, double y) {
+	/* a monitor on its stand */
+	cairo_rectangle(cr, x + 1.5, y + 3.5, 21, 13);
+	cairo_stroke(cr);
+	cairo_move_to(cr, x + 12, y + 16.5);
+	cairo_line_to(cr, x + 12, y + 20.5);
+	cairo_move_to(cr, x + 7, y + 20.5);
+	cairo_line_to(cr, x + 17, y + 20.5);
+	cairo_stroke(cr);
+}
+
+static void icon_date(cairo_t *cr, double x, double y) {
+	/* a clock at ten past ten, Windows' hour */
+	cairo_arc(cr, x + 12, y + 12, 10, 0, 2 * M_PI);
+	cairo_stroke(cr);
+	cairo_move_to(cr, x + 12, y + 12);
+	cairo_line_to(cr, x + 12, y + 5.5);
+	cairo_move_to(cr, x + 12, y + 12);
+	cairo_line_to(cr, x + 16.5, y + 14.5);
+	cairo_stroke(cr);
+}
+
+static void icon_about(cairo_t *cr, double x, double y) {
+	/* an i in a circle */
+	cairo_arc(cr, x + 12, y + 12, 10, 0, 2 * M_PI);
+	cairo_stroke(cr);
+	cairo_arc(cr, x + 12, y + 7.5, 1.2, 0, 2 * M_PI);
+	cairo_fill(cr);
+	cairo_move_to(cr, x + 12, y + 10.5);
+	cairo_line_to(cr, x + 12, y + 17.5);
+	cairo_stroke(cr);
+}
+
+/* the phone's name, from ztOSIAL's manifest ([device] name = "..."), and
+ * the size of its memory */
+static const char *device_name(void) {
+	static char name[96];
+	if (name[0]) return name;
+	snprintf(name, sizeof(name), "this phone");
+	FILE *f = fopen("/vendor/ztos/manifest.toml", "r");
+	if (!f) return name;
+	char line[256];
+	bool in_device = false;
+	while (fgets(line, sizeof(line), f)) {
+		if (line[0] == '[') {
+			in_device = strncmp(line, "[device]", 8) == 0;
+			continue;
+		}
+		char *q;
+		if (in_device && strncmp(line, "name", 4) == 0 && (q = strchr(line, '"'))) {
+			char *end = strchr(q + 1, '"');
+			if (end) {
+				*end = 0;
+				snprintf(name, sizeof(name), "%s", q + 1);
+			}
+			break;
+		}
+	}
+	fclose(f);
+	return name;
+}
+
+static double ram_gb(void) {
+	struct sysinfo si;
+	if (sysinfo(&si) != 0) return 0;
+	return (double)si.totalram * si.mem_unit / (1024.0 * 1024 * 1024);
+}
+
 static double draw_main(cairo_t *cr) {
 	double y = zmc_pivot_next(cr, "system", "applications", ACT_OPEN_PAGE, PAGE_APPS);
 	char detail[128], wifi[96];
 
 	snprintf(detail, sizeof(detail), "accent: %s, %d columns",
 		ACCENTS[app.accent].name, app.columns);
-	y = zmc_entry(cr, y, "theme", detail, ACT_OPEN_PAGE, PAGE_THEME);
-	y = zmc_entry(cr, y, "navigation bar", "choose the centre icon", ACT_OPEN_PAGE, PAGE_NAVIGATION);
+	y = zmc_entry_icon(cr, y, icon_theme, "theme", detail, ACT_OPEN_PAGE, PAGE_THEME);
+	y = zmc_entry_icon(cr, y, icon_navigation, "navigation bar", "choose the centre icon", ACT_OPEN_PAGE, PAGE_NAVIGATION);
 
 	snprintf(detail, sizeof(detail), "%d%% brightness, %s timeout",
 		app.brightness, app.timeout_idx == 4 ? "Never" : "1 min");
-	y = zmc_entry(cr, y, "display", detail, ACT_OPEN_PAGE, PAGE_DISPLAY);
+	y = zmc_entry_icon(cr, y, icon_display, "display", detail, ACT_OPEN_PAGE, PAGE_DISPLAY);
 
 	wifi_summary(wifi, sizeof(wifi));
-	y = zmc_entry(cr, y, "Wi-Fi", wifi, ACT_OPEN_PAGE, PAGE_WIFI);
+	y = zmc_entry_icon(cr, y, icon_wifi, "Wi-Fi", wifi, ACT_OPEN_PAGE, PAGE_WIFI);
 
 	bt_summary(detail, sizeof(detail));
-	y = zmc_entry(cr, y, "Bluetooth", detail, ACT_OPEN_PAGE, PAGE_BLUETOOTH);
+	y = zmc_entry_icon(cr, y, icon_bluetooth, "Bluetooth", detail, ACT_OPEN_PAGE, PAGE_BLUETOOTH);
 
 	cell_load();
 	snprintf(detail, sizeof(detail), "%s%s%s%s", cell.operator[0] ? cell.operator : "no service",
 		cell.tech[0] ? ", " : "", cell.tech, !cell.data_on ? ", data off" : cell.data ?
 		", data connected" : ", data on");
-	y = zmc_entry(cr, y, "cellular + SIM", detail, ACT_OPEN_PAGE, PAGE_MOBILE);
+	y = zmc_entry_icon(cr, y, icon_cellular, "cellular & SIM", detail, ACT_OPEN_PAGE, PAGE_MOBILE);
 
 	snprintf(detail, sizeof(detail), "media %d%%, ring %d%%", app.media_vol, app.ring_vol);
-	y = zmc_entry(cr, y, "ringtones + sounds", detail, ACT_OPEN_PAGE, PAGE_AUDIO);
+	y = zmc_entry_icon(cr, y, icon_sounds, "ringtones & sounds", detail, ACT_OPEN_PAGE, PAGE_AUDIO);
 
 	if (!app.haptics) {
 		snprintf(detail, sizeof(detail), "off");
@@ -875,30 +1099,31 @@ static double draw_main(cairo_t *cr) {
 		snprintf(detail, sizeof(detail), "on, strength %d%%, %d of %d kinds", app.haptic_strength,
 			on, N_HAPTIC_GROUPS);
 	}
-	y = zmc_entry(cr, y, "haptics", detail, ACT_OPEN_PAGE, PAGE_HAPTICS);
+	y = zmc_entry_icon(cr, y, icon_haptics, "haptics", detail, ACT_OPEN_PAGE, PAGE_HAPTICS);
 
 	snprintf(detail, sizeof(detail), "%s, %s, %s, %s\u2026", QUICK_NAMES[app.quick[0]],
 		QUICK_NAMES[app.quick[1]], QUICK_NAMES[app.quick[2]], QUICK_NAMES[app.quick[3]]);
-	y = zmc_entry(cr, y, "notifications + actions", detail, ACT_OPEN_PAGE, PAGE_QUICK);
+	y = zmc_entry_icon(cr, y, icon_notifications, "notifications & actions", detail, ACT_OPEN_PAGE, PAGE_QUICK);
 
 	char bat_buf[32];
 	read_sys_file(hw_file(hw_battery(), "capacity"), bat_buf, sizeof(bat_buf));
 	int bat = bat_buf[0] ? atoi(bat_buf) : 51;
 	snprintf(detail, sizeof(detail), "%d%%, %s", bat, app.battery_saver ? "battery saver on" : "discharging");
-	y = zmc_entry(cr, y, "battery saver", detail, ACT_OPEN_PAGE, PAGE_BATTERY);
+	y = zmc_entry_icon(cr, y, icon_battery, "battery saver", detail, ACT_OPEN_PAGE, PAGE_BATTERY);
 
-	snprintf(detail, sizeof(detail), "Exynos 9810 (8 cores), %s", app.cpu_gov);
-	y = zmc_entry(cr, y, "processor", detail, ACT_OPEN_PAGE, PAGE_CPU);
+	snprintf(detail, sizeof(detail), "%ld cores, %s", sysconf(_SC_NPROCESSORS_CONF), app.cpu_gov);
+	y = zmc_entry_icon(cr, y, icon_processor, "processor", detail, ACT_OPEN_PAGE, PAGE_CPU);
 
-	snprintf(detail, sizeof(detail), "3.5 GB RAM, swappiness %d", app.swappiness);
-	y = zmc_entry(cr, y, "virtual memory", detail, ACT_OPEN_PAGE, PAGE_VM);
+	snprintf(detail, sizeof(detail), "%.1f GB RAM, swappiness %d", ram_gb(), app.swappiness);
+	y = zmc_entry_icon(cr, y, icon_memory, "virtual memory", detail, ACT_OPEN_PAGE, PAGE_VM);
 
-	snprintf(detail, sizeof(detail), "Mali-G72 MP18 (%s), 60 FPS", app.gpu_gov);
-	y = zmc_entry(cr, y, "graphics", detail, ACT_OPEN_PAGE, PAGE_GPU);
+	snprintf(detail, sizeof(detail), "governor: %s", app.gpu_gov);
+	y = zmc_entry_icon(cr, y, icon_graphics, "graphics", detail, ACT_OPEN_PAGE, PAGE_GPU);
 
-	y = zmc_entry(cr, y, "date + region", "date, time zone and regional formats", ACT_OPEN_PAGE, PAGE_DATE);
+	y = zmc_entry_icon(cr, y, icon_date, "date & region", "date, time zone and regional formats", ACT_OPEN_PAGE, PAGE_DATE);
 
-	y = zmc_entry(cr, y, "about", "Samsung Galaxy S9, ztOS Mobile", ACT_OPEN_PAGE, PAGE_ABOUT);
+	snprintf(detail, sizeof(detail), "%s, ztOS Mobile", device_name());
+	y = zmc_entry_icon(cr, y, icon_about, "about", detail, ACT_OPEN_PAGE, PAGE_ABOUT);
 
 	return y + 20;
 }
@@ -1601,9 +1826,15 @@ static double draw_theme(cairo_t *cr) {
 	/* Windows Phone's list picker, collapsed: the box shows the choice and
 	 * opens the full-screen picker (UIXMobile!ListPicker in full mode) */
 	y += 20;
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);	/* Windows 10's combo box, at rest */
 	cairo_set_line_width(cr, 2);
 	cairo_rectangle(cr, MARGIN + 1, y + 1, zmc.width - 2 * MARGIN - 2, 40);
+	cairo_stroke(cr);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	cairo_set_line_width(cr, 1.5);
+	cairo_move_to(cr, zmc.width - MARGIN - 22, y + 18);
+	cairo_line_to(cr, zmc.width - MARGIN - 17, y + 23);
+	cairo_line_to(cr, zmc.width - MARGIN - 12, y + 18);
 	cairo_stroke(cr);
 	zmc_set_rgb(cr, ACCENTS[app.accent].color);
 	cairo_rectangle(cr, MARGIN + 10, y + 10, 22, 22);
@@ -1945,38 +2176,36 @@ static double draw_wifi(cairo_t *cr) {
 		snprintf(detail, sizeof(detail), "%s", n->in_use ? "connected" :
 			n->known ? (n->secured ? "saved, secured" : "saved, open") :
 			n->secured ? "secured" : "open");
-		/* the fan, as many of its arcs lit as the signal has */
-		if (n->in_use) {
-			zmc_set_rgb(cr, ACCENTS[app.accent].color);
-		} else {
-			cairo_set_source_rgb(cr, 1, 1, 1);
-		}
-		zmc_wifi_glyph(cr, MARGIN - 2, y + 8, 30, wifi_bars_of(n->signal));
-		zmc_text_line(cr, n->ssid, FONT_SEMILIGHT, 22, MARGIN + 42, y, zmc.width - MARGIN - 42 - 12);
+		/* the fan, as many of its arcs lit as the signal has, white: Windows
+		 * 10 Mobile's list, the name in the body font, the state under it
+		 * (in the accent for the network in use) */
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_wifi_glyph(cr, MARGIN, y + 4, 24, wifi_bars_of(n->signal));
+		zmc_text_line(cr, n->ssid, FONT_REGULAR, 16, MARGIN + 40, y, zmc.width - MARGIN - 40 - 12);
 		if (n->in_use) {
 			zmc_set_rgb(cr, ACCENTS[app.accent].color);
 		} else {
 			cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 		}
-		zmc_text(cr, detail, FONT_REGULAR, 12.5, MARGIN + 42, y + 29, 0);
+		zmc_text(cr, detail, FONT_REGULAR, 12, MARGIN + 40, y + 22, 0);
 		if (n->secured) {
 			/* a small padlock at the fan's foot */
 			cairo_set_source_rgb(cr, 0.75, 0.75, 0.75);
-			cairo_rectangle(cr, MARGIN + 19, y + 30, 9, 7);
+			cairo_rectangle(cr, MARGIN + 16, y + 22, 7, 6);
 			cairo_fill(cr);
-			cairo_set_line_width(cr, 1.5);
-			cairo_arc(cr, MARGIN + 23.5, y + 30, 3, M_PI, 2 * M_PI);
+			cairo_set_line_width(cr, 1.3);
+			cairo_arc(cr, MARGIN + 19.5, y + 22, 2.3, M_PI, 2 * M_PI);
 			cairo_stroke(cr);
 		}
-		zmc_add_hit(0, y - 4, zmc.width, 56, ACT_WIFI_CONNECT, i);
+		zmc_add_hit(0, y - 6, zmc.width, 52, ACT_WIFI_CONNECT, i);
 		if (i == wifi_menu) {
-			menu_at = y + 52;
+			menu_at = y + 48;
 		}
-		y += 60;
+		y += 56;
 	}
 
 	zmc_set_rgb(cr, ACCENTS[app.accent].color);
-	zmc_text(cr, "search again", FONT_SEMILIGHT, 19, MARGIN, y + 8, 0);
+	zmc_text(cr, "Refresh", FONT_REGULAR, 15, MARGIN, y + 8, 0);
 	zmc_add_hit(0, y, zmc.width, 46, ACT_WIFI_RESCAN, 0);
 	y += 72;
 

@@ -69,15 +69,28 @@ U=$R/usr/share/alsa/ucm2
 install -Dm644 "$A/ucm2/Google/cheetah/HiFi.conf" "$U/Google/panther/HiFi.conf"
 rm -r "$U/Google/cheetah"
 sed -i 's|/Google/cheetah/|/Google/panther/|' "$U/conf.d/aoc-snd-card/aoc-snd-card.conf"
-# The amplifiers stay at omarchy-mobile's media levels (17 dB under stock):
-# at stock's 817 / 17, with none of stock's AoC processing in front, music
-# heated the coils past the watchdog's limit (earpiece 25 -> 60 C) and the
-# bottom speaker distorted (2026-10-26). Even at media, music above about
-# -18 dBFS overdrives them (the protection firmware clips audibly and the
-# bottom coil heats past the watchdog's limit; a -16 dBFS limiter did not
-# stop it). 50 % of PipeWire's volume (-18 dB) played clean, so the
-# filter's trims make 100 % that
-sed -i 's/\(name = trim_[lr] *label = linear *control = { "Mult" = \)1.0/\10.125/' \
+# The amplifiers: stage c9 at digital 657 / analog 17 (20 dB under stock's
+# 817 digital), with stock's V/I feedback stream to the AoC. At stock's
+# 817 / 17, with none of stock's AoC processing in front, music heated the
+# coils past the watchdog's limit (earpiece 25 -> 60 C) and the bottom
+# speaker distorted; at media's 737 / 10 the bottom speaker hissed through
+# the protection firmware. 657 / 17 played the tone tests clean, and the
+# feedback stream made the bottom's hiss a little smaller (2026-10-26).
+# Stage c9 also needs speaker_protection=1 (overlay/etc/modprobe.d) and the
+# phone's own verification stamp: once, during playback,
+#   omamobile-speaker-protection verify
+cat >> "$R/etc/omamobile/speaker.conf" <<'EOF'
+# ztOS, Pixel 7 (devices/google-panther/layer.sh)
+OMAMOBILE_SPK_STAGE=c9
+OMAMOBILE_SPK_DIGITAL=657
+OMAMOBILE_SPK_ANALOG=17
+OMAMOBILE_SPK_FEEDBACK=1
+EOF
+# The filter's trims: -12 dB. A -10 dBFS multitone held the coils at 25 C
+# up to -9 dB; at -6 dB the bottom's coil temperature jumped 25 -> 52 C in
+# under a second (most likely the firmware's estimate, but the watchdog
+# mutes), so music, with its peaks, gets 3 dB more room (2026-10-26)
+sed -i 's/\(name = trim_[lr] *label = linear *control = { "Mult" = \)1.0/\10.25/' \
 	"$R/usr/share/pipewire/pipewire.conf.d/60-omamobile-speaker-loudness.conf"
 
 # the Windows Phone / Lumia photos, made from the OneDrive zip by os/wallpapers/make-wallpapers.py
@@ -100,4 +113,4 @@ rm -rf "$R/usr/src/omamobile-bootctl"
 install -m755 "$B/bin/omamobile-boot-success" "$R/usr/bin/omamobile-boot-success"
 install -m644 "$B/vendor/systemd/system/omamobile-boot-success.service" "$R/etc/systemd/system/"
 
-DEVICE_UNITS="zboot-usb-gadget ztos-usb-dhcp zboot-firstboot ztos-wifi bluetooth omamobile-boot-success"
+DEVICE_UNITS="zboot-usb-gadget ztos-usb-dhcp zboot-firstboot ztos-wifi bluetooth omamobile-boot-success omamobile-speaker-protection"

@@ -1,0 +1,11 @@
+[Unit]
+Description=DHCP for the computer on the USB link (172.16.42.2)
+After=zboot-usb-gadget.service
+Requires=zboot-usb-gadget.service
+
+[Service]
+ExecStart=/usr/bin/dnsmasq --keep-in-foreground --conf-file=/etc/ztos/usb-dhcp.conf
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

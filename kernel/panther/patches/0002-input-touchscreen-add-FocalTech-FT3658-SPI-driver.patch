@@ -1,0 +1,329 @@
+# FocalTech FT3658 on SPI (Pixel 7 touch): a mainline driver for the protocol of Google's GPL focal_touch (ft3658/), fingers only
+diff --git a/drivers/input/touchscreen/Kconfig b/drivers/input/touchscreen/Kconfig
+index 10f4ddb2c..580a09c3f 100644
+--- a/drivers/input/touchscreen/Kconfig
++++ b/drivers/input/touchscreen/Kconfig
+@@ -383,6 +383,16 @@ config TOUCHSCREEN_FUJITSU
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called fujitsu-ts.
+ 
++config TOUCHSCREEN_FOCALTECH_FT3658
++	tristate "FocalTech FT3658 SPI touchscreen"
++	depends on SPI
++	help
++	  Say Y here for the FocalTech FT3658 touchscreen on SPI, as on the
++	  Google Pixel 7.
++
++	  To compile this driver as a module, choose M here: the module will
++	  be called focaltech_ft3658.
++
+ config TOUCHSCREEN_GOODIX
+ 	tristate "Goodix I2C touchscreen"
+ 	depends on I2C
+diff --git a/drivers/input/touchscreen/Makefile b/drivers/input/touchscreen/Makefile
+index db500698e..bcbb0742a 100644
+--- a/drivers/input/touchscreen/Makefile
++++ b/drivers/input/touchscreen/Makefile
+@@ -44,6 +44,7 @@ obj-$(CONFIG_TOUCHSCREEN_EGALAX)	+= egalax_ts.o
+ obj-$(CONFIG_TOUCHSCREEN_EGALAX_SERIAL)	+= egalax_ts_serial.o
+ obj-$(CONFIG_TOUCHSCREEN_EXC3000)	+= exc3000.o
+ obj-$(CONFIG_TOUCHSCREEN_FUJITSU)	+= fujitsu_ts.o
++obj-$(CONFIG_TOUCHSCREEN_FOCALTECH_FT3658)	+= focaltech_ft3658.o
+ obj-$(CONFIG_TOUCHSCREEN_GOODIX)	+= goodix_ts.o
+ obj-$(CONFIG_TOUCHSCREEN_GOODIX_BERLIN_CORE)	+= goodix_berlin_core.o
+ obj-$(CONFIG_TOUCHSCREEN_GOODIX_BERLIN_I2C)	+= goodix_berlin_i2c.o
+diff --git a/drivers/input/touchscreen/focaltech_ft3658.c b/drivers/input/touchscreen/focaltech_ft3658.c
+new file mode 100644
+index 000000000..6fc51fddf
+--- /dev/null
++++ b/drivers/input/touchscreen/focaltech_ft3658.c
+@@ -0,0 +1,289 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * FocalTech FT3658 touchscreen on SPI (Google Pixel 7, panther).
++ *
++ * Only what reports fingers: the bus framing, the chip id and the touch
++ * frame. The protocol is the one of Google's GPL focal_touch driver
++ * (kernel/google-modules/touch/focaltech_touch, ft3658/); its heatmap,
++ * touch offload, gestures and firmware update are left out, so the
++ * controller runs the firmware already in its flash.
++ *
++ * Every transfer is a 4-byte header (register, control, length), three
++ * dummy bytes, the data and, on reads, a CRC-16/KERMIT of the data.
++ */
++
++#include <linux/bits.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/input.h>
++#include <linux/input/mt.h>
++#include <linux/input/touchscreen.h>
++#include <linux/interrupt.h>
++#include <linux/module.h>
++#include <linux/mod_devicetable.h>
++#include <linux/regulator/consumer.h>
++#include <linux/spi/spi.h>
++
++#define FT3658_CTRL_WRITE	0x00
++#define FT3658_CTRL_READ	0xa0	/* read, with the data's CRC after it */
++#define FT3658_STATUS_BAD	0xa0	/* in the 4th byte clocked back */
++#define FT3658_DUMMY		3
++#define FT3658_HEADER		(4 + FT3658_DUMMY)
++#define FT3658_CS_HIGH_US	150	/* between transfers */
++#define FT3658_RETRIES		3
++
++#define FT3658_REG_TOUCH	0x01
++#define FT3658_REG_CHIP_ID	0xa3
++#define FT3658_REG_FW_VER	0xa6
++#define FT3658_REG_HEATMAP	0x9e
++#define FT3658_REG_HEATMAP_ZIP	0xed
++
++#define FT3658_CHIP_ID		0x56
++#define FT3658_MAX_POINTS	10
++#define FT3658_POINT_LEN	6
++/* the firmware's touch frame: 2 header bytes, then 6 bytes a finger */
++#define FT3658_FRAME_LEN	90
++
++#define FT3658_EVENT_DOWN	0
++#define FT3658_EVENT_UP		1
++#define FT3658_EVENT_CONTACT	2
++
++#define FT3658_BUF_LEN		(FT3658_HEADER + FT3658_FRAME_LEN + 2)
++
++struct ft3658 {
++	struct spi_device *spi;
++	struct input_dev *input;
++	struct gpio_desc *reset;
++	struct touchscreen_properties prop;
++	u8 tx[FT3658_BUF_LEN] ____cacheline_aligned;
++	u8 rx[FT3658_BUF_LEN];
++};
++
++static u16 ft3658_crc(const u8 *data, size_t len)
++{
++	u16 crc = 0xffff;
++	int i;
++
++	while (len--) {
++		crc ^= *data++;
++		for (i = 0; i < 8; i++)
++			crc = crc & 1 ? (crc >> 1) ^ 0x8408 : crc >> 1;
++	}
++	return crc;
++}
++
++static int ft3658_xfer(struct ft3658 *ts, size_t len)
++{
++	struct spi_transfer xfer = {
++		.tx_buf = ts->tx,
++		.rx_buf = ts->rx,
++		.len = len,
++	};
++	int ret;
++
++	ret = spi_sync_transfer(ts->spi, &xfer, 1);
++	usleep_range(FT3658_CS_HIGH_US, FT3658_CS_HIGH_US + 50);
++	if (ret)
++		return ret;
++	return ts->rx[3] & FT3658_STATUS_BAD ? -EIO : 0;
++}
++
++static int ft3658_read(struct ft3658 *ts, u8 reg, u8 *data, size_t len)
++{
++	size_t total = FT3658_HEADER + len + 2;
++	const u8 *got = ts->rx + FT3658_HEADER;
++	int ret = -EIO, i;
++
++	if (total > FT3658_BUF_LEN)
++		return -EINVAL;
++
++	for (i = 0; i < FT3658_RETRIES; i++) {
++		memset(ts->tx, 0, total);
++		ts->tx[0] = reg;
++		ts->tx[1] = FT3658_CTRL_READ;
++		ts->tx[2] = len >> 8;
++		ts->tx[3] = len & 0xff;
++
++		ret = ft3658_xfer(ts, total);
++		if (ret)
++			continue;
++		if (ft3658_crc(got, len) != (got[len] | got[len + 1] << 8)) {
++			ret = -EBADMSG;
++			continue;
++		}
++		memcpy(data, got, len);
++		return 0;
++	}
++	return ret;
++}
++
++static int ft3658_write_reg(struct ft3658 *ts, u8 reg, u8 value)
++{
++	int ret = -EIO, i;
++
++	for (i = 0; i < FT3658_RETRIES; i++) {
++		memset(ts->tx, 0, FT3658_HEADER + 1);
++		ts->tx[0] = reg;
++		ts->tx[1] = FT3658_CTRL_WRITE;
++		ts->tx[2] = 0;
++		ts->tx[3] = 1;
++		ts->tx[FT3658_HEADER] = value;
++
++		ret = ft3658_xfer(ts, FT3658_HEADER + 1);
++		if (!ret)
++			return 0;
++	}
++	return ret;
++}
++
++static int ft3658_read_reg(struct ft3658 *ts, u8 reg, u8 *value)
++{
++	return ft3658_read(ts, reg, value, 1);
++}
++
++static irqreturn_t ft3658_irq(int irq, void *dev_id)
++{
++	struct ft3658 *ts = dev_id;
++	u8 frame[FT3658_FRAME_LEN];
++	int i;
++
++	if (ft3658_read(ts, FT3658_REG_TOUCH, frame, sizeof(frame)))
++		return IRQ_HANDLED;
++
++	/* frame[1]: the number of fingers down; then one record each */
++	for (i = 0; i < FT3658_MAX_POINTS; i++) {
++		const u8 *p = frame + 2 + i * FT3658_POINT_LEN;
++		unsigned int id = p[2] >> 4;
++		unsigned int event = p[0] >> 6;
++		unsigned int x, y;
++		bool down;
++
++		if (id >= FT3658_MAX_POINTS)
++			break;
++
++		x = (p[0] & 0x0f) << 8 | p[1];
++		y = (p[2] & 0x0f) << 8 | p[3];
++		down = event == FT3658_EVENT_DOWN || event == FT3658_EVENT_CONTACT;
++
++		input_mt_slot(ts->input, id);
++		if (!input_mt_report_slot_state(ts->input, MT_TOOL_FINGER, down))
++			continue;
++		touchscreen_report_pos(ts->input, &ts->prop, x, y, true);
++		input_report_abs(ts->input, ABS_MT_TOUCH_MAJOR, p[5] >> 1);
++		input_report_abs(ts->input, ABS_MT_TOUCH_MINOR, p[4] >> 1);
++	}
++
++	input_mt_sync_frame(ts->input);
++	input_sync(ts->input);
++	return IRQ_HANDLED;
++}
++
++static int ft3658_wait_ready(struct ft3658 *ts)
++{
++	int ms;
++	u8 id;
++
++	for (ms = 0; ms < 1000; ms += 50) {
++		if (!ft3658_read_reg(ts, FT3658_REG_CHIP_ID, &id)) {
++			if (id == FT3658_CHIP_ID)
++				return 0;
++			dev_dbg(&ts->spi->dev, "chip id %#04x, waiting\n", id);
++		}
++		msleep(50);
++	}
++	return -ETIMEDOUT;
++}
++
++static int ft3658_probe(struct spi_device *spi)
++{
++	struct device *dev = &spi->dev;
++	struct ft3658 *ts;
++	u8 fw = 0;
++	int ret;
++
++	ts = devm_kzalloc(dev, sizeof(*ts), GFP_KERNEL);
++	if (!ts)
++		return -ENOMEM;
++	ts->spi = spi;
++	spi_set_drvdata(spi, ts);
++
++	spi->mode = SPI_MODE_0;
++	spi->bits_per_word = 8;
++	ret = spi_setup(spi);
++	if (ret)
++		return ret;
++
++	/*
++	 * Stock's power-up: in reset, AVDD then VDD, 1 ms, out of reset, then
++	 * 200 ms for the firmware to start.
++	 */
++	ts->reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(ts->reset))
++		return dev_err_probe(dev, PTR_ERR(ts->reset), "reset gpio\n");
++	ret = devm_regulator_get_enable_optional(dev, "avdd");
++	if (ret && ret != -ENODEV)
++		return dev_err_probe(dev, ret, "avdd\n");
++	ret = devm_regulator_get_enable_optional(dev, "vdd");
++	if (ret && ret != -ENODEV)
++		return dev_err_probe(dev, ret, "vdd\n");
++	usleep_range(1000, 2000);
++	gpiod_set_value_cansleep(ts->reset, 0);
++	msleep(200);
++
++	ret = ft3658_wait_ready(ts);
++	if (ret)
++		return dev_err_probe(dev, ret, "no FT3658 answers\n");
++	ft3658_read_reg(ts, FT3658_REG_FW_VER, &fw);
++	dev_info(dev, "FT3658, firmware %#04x\n", fw);
++
++	/* the frame is the touch points alone: no heatmap after them */
++	ft3658_write_reg(ts, FT3658_REG_HEATMAP_ZIP, 0);
++	ft3658_write_reg(ts, FT3658_REG_HEATMAP, 0);
++
++	ts->input = devm_input_allocate_device(dev);
++	if (!ts->input)
++		return -ENOMEM;
++	ts->input->name = "FocalTech FT3658 Touchscreen";
++	ts->input->id.bustype = BUS_SPI;
++	input_set_abs_params(ts->input, ABS_MT_POSITION_X, 0, 1079, 0, 0);
++	input_set_abs_params(ts->input, ABS_MT_POSITION_Y, 0, 2399, 0, 0);
++	input_set_abs_params(ts->input, ABS_MT_TOUCH_MAJOR, 0, 127, 0, 0);
++	input_set_abs_params(ts->input, ABS_MT_TOUCH_MINOR, 0, 127, 0, 0);
++	touchscreen_parse_properties(ts->input, true, &ts->prop);
++
++	ret = input_mt_init_slots(ts->input, FT3658_MAX_POINTS,
++				  INPUT_MT_DIRECT | INPUT_MT_DROP_UNUSED);
++	if (ret)
++		return ret;
++	ret = input_register_device(ts->input);
++	if (ret)
++		return ret;
++
++	return devm_request_threaded_irq(dev, spi->irq, NULL, ft3658_irq,
++					 IRQF_ONESHOT, "ft3658", ts);
++}
++
++static const struct of_device_id ft3658_of_match[] = {
++	{ .compatible = "focaltech,ft3658" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, ft3658_of_match);
++
++static const struct spi_device_id ft3658_spi_ids[] = {
++	{ "ft3658" },
++	{ }
++};
++MODULE_DEVICE_TABLE(spi, ft3658_spi_ids);
++
++static struct spi_driver ft3658_driver = {
++	.driver = {
++		.name = "ft3658",
++		.of_match_table = ft3658_of_match,
++	},
++	.id_table = ft3658_spi_ids,
++	.probe = ft3658_probe,
++};
++module_spi_driver(ft3658_driver);
++
++MODULE_DESCRIPTION("FocalTech FT3658 SPI touchscreen");
++MODULE_LICENSE("GPL");

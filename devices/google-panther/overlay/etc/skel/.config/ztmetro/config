@@ -1,0 +1,8 @@
+# ztMETRO configuration, written by ztsettings
+# Pixel 7: the screen never sleeps by itself while it has no touch driver to wake it
+accent = cobalt
+columns = 3
+haptics = on
+timeout = 0
+lock = on
+menu_speed = 75

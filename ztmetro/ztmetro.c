@@ -2678,7 +2678,7 @@ static void load_config(struct zt_server *server) {
 	for (int i = 0; i < 8; i++) {
 		server->haptic_level[i] = 100;
 	}
-	server->scale = 4.0f;
+	server->scale = 0.0f;		/* unset: the screen's width over 360 points (server_new_output) */
 	server->units = 6;		/* three medium tiles across */
 	server->menu_speed = 75;
 	server->key_height = DEFAULT_KEY_HEIGHT;
@@ -5303,11 +5303,24 @@ static void boot_anim_start(struct zt_server *server) {
 	damage(server);
 }
 
+/* Samsung's sensor hub is the S9's alone: on any other target nothing waits for it.
+ * Without /etc/ztos/target it is waited for, as before targets had one. */
+static bool target_has_sensorhub(void) {
+	char target[32] = {0};
+	FILE *f = fopen("/etc/ztos/target", "r");
+	if (!f) {
+		return true;
+	}
+	bool got = fgets(target, sizeof(target), f) != NULL;
+	fclose(f);
+	return !got || strncmp(target, "starlte", 7) == 0;
+}
+
 static int boot_check_sensorhub(void *data) {
 	struct zt_server *server = data;
 	bool test_fail = getenv("ZT_TEST_SENSORHUB_FAIL") != NULL;
 
-	bool sensor_ready = server->boot_skip_sensorhub;
+	bool sensor_ready = server->boot_skip_sensorhub || (!test_fail && !target_has_sensorhub());
 	if (!sensor_ready && !test_fail) {
 		char buf[16] = {0};
 		int fd = open("/sys/class/sec/sensorhub/ready", O_RDONLY);
@@ -11064,6 +11077,13 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	if (mode) {
 		wlr_output_state_set_mode(&state, mode);
 	}
+	/* Every phone is 360 points across, as Windows Phone was: 4 pixels a
+	 * point on the S9's 1440, 3 on the Pixel 7's 1080. A scale in the
+	 * config wins. */
+	if (server->scale <= 0.0f) {
+		int across = mode ? (mode->width < mode->height ? mode->width : mode->height) : 0;
+		server->scale = across > 0 ? across / 360.0f : 4.0f;
+	}
 	wlr_output_state_set_scale(&state, server->scale);
 	wlr_output_commit_state(wlr_output, &state);
 	wlr_output_state_finish(&state);
@@ -11273,6 +11293,9 @@ static int render_to_files(struct zt_server *server, const char *dir) {
 	g_dump_dir = dir;
 	server->width = 360;
 	server->height = 740;
+	if (server->scale <= 0.0f) {
+		server->scale = 4.0f;	/* no screen to take it from: the S9's */
+	}
 	server->screen_on = true;
 	load_logo(server);
 	load_tiles(server);
@@ -11384,8 +11407,8 @@ int main(int argc, char *argv[]) {
 	if (argc == 3 && strcmp(argv[1], "--render") == 0) {
 		return render_to_files(&server, argv[2]);
 	}
-	if (server.scale < 1.0f) {
-		server.scale = 1.0f;
+	if (server.scale > 0.0f && server.scale < 1.0f) {
+		server.scale = 1.0f;	/* 0 stays: unset, the output's own (server_new_output) */
 	}
 
 	/* Panfrost compresses textures that sit unchanged (AFBC) and on the

@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: MIT
+# ztOS: omarchy-mobile's unit after ztos-aoc.service.
+# The speaker amplifiers with Cirrus protection and the factory calibration
+# (device/cheetah/AOC-PLAN.md stage C8). Not enabled by the package: enable it
+# once C8 has passed by hand,
+#   systemctl enable omamobile-speaker-protection
+# Until then the amplifier driver stays blacklisted (modprobe.d/omamobile-audio.conf),
+# so there is no AoC sound card at boot. If a start hangs, the next boot leaves
+# the amplifiers off (see the script).
+#
+# Ordered before user sessions, so PipeWire probes the card once, after the
+# amplifiers are set up (the AoC is up about 5 s into boot; the timeout bounds
+# the wait).
+[Unit]
+Description=Speaker amplifiers with protection firmware and factory calibration (hang-safe)
+Requires=ztos-aoc.service
+After=ztos-aoc.service
+Wants=omamobile-speaker-watch.service
+Before=systemd-user-sessions.service
+ConditionPathExists=/sys/bus/platform/devices/181d0000.aoc
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/omamobile/speaker.conf
+# start is also the recovery: with the driver already bound it rebinds both
+# amplifiers (a chip reset) before setting them up again
+ExecStart=/usr/bin/omamobile-speaker-protection start
+ExecStop=/usr/bin/omamobile-speaker-protection mute
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

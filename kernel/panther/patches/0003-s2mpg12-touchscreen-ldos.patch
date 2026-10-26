@@ -1,0 +1,181 @@
+# S2MPG12: the touchscreen's LDO25M and LDO26M as regulators, and the PMIC without an interrupt (LDOs only)
+diff --git a/drivers/mfd/sec-acpm.c b/drivers/mfd/sec-acpm.c
+index 0b850433e..78513f3bc 100644
+--- a/drivers/mfd/sec-acpm.c
++++ b/drivers/mfd/sec-acpm.c
+@@ -373,8 +373,9 @@ static const struct regmap_config s2mpg11_regmap_config_meter = {
+ 
+ /*
+  * S2MPG12 (gs201 main PMIC): only what the RTC and the interrupt controller
+- * need. Writes are limited to the interrupt masks and the RTC, so that
+- * nothing here can change a rail. No caching: every access goes to the PMIC.
++ * need, and the touchscreen's LDOs. Writes are limited to the interrupt
++ * masks, the RTC and those two LDOs, so that no other rail can change. No
++ * caching: every access goes to the PMIC.
+  */
+ static const struct regmap_range s2mpg12_common_registers[] = {
+ 	regmap_reg_range(0x00, 0x10), /* VGPIO, I3C, IBI, CHIPID, IBI masks */
+@@ -407,6 +408,8 @@ static const struct regmap_config s2mpg12_regmap_config_common = {
+ 
+ static const struct regmap_range s2mpg12_pmic_wr_registers[] = {
+ 	regmap_reg_range(S2MPG12_PMIC_INT1M, S2MPG12_PMIC_INT5M),
++	/* the touchscreen's two LDOs, the only rails switched from here */
++	regmap_reg_range(S2MPG12_PMIC_L25M_CTRL, S2MPG12_PMIC_L26M_CTRL),
+ };
+ 
+ static const struct regmap_range s2mpg12_pmic_precious_registers[] = {
+@@ -681,7 +684,8 @@ static int sec_pmic_acpm_probe(struct platform_device *pdev)
+ 	if (IS_ERR(acpm))
+ 		return dev_err_probe(dev, PTR_ERR(acpm), "failed to get acpm\n");
+ 
+-	if (pdata->no_irq) {
++	/* S2MPG12 without "interrupts": its LDOs only, no RTC (sec-common.c) */
++	if (pdata->no_irq || !of_property_present(dev->of_node, "interrupts")) {
+ 		irq = 0;
+ 	} else {
+ 		irq = platform_get_irq(pdev, 0);
+diff --git a/drivers/mfd/sec-common.c b/drivers/mfd/sec-common.c
+index 94a01f362..d6d23ff69 100644
+--- a/drivers/mfd/sec-common.c
++++ b/drivers/mfd/sec-common.c
+@@ -60,8 +60,13 @@ static const struct resource s2mpg12_rtc_resources[] = {
+ 	DEFINE_RES_IRQ_NAMED(S2MPG12_IRQ_RTCA0, "alarm"),
+ };
+ 
+-/* Only the RTC so far: the rails stay as the bootloader set them. */
++/*
++ * The touchscreen's LDOs and the RTC: the other rails stay as the bootloader
++ * set them. The regulators come first: they are all there is when the PMIC
++ * is described without an interrupt.
++ */
+ static const struct mfd_cell s2mpg12_devs[] = {
++	MFD_CELL_NAME("s2mpg12-regulator"),
+ 	MFD_CELL_RES("s2mpg12-rtc", s2mpg12_rtc_resources),
+ };
+ 
+@@ -266,7 +271,8 @@ int sec_pmic_probe(struct device *dev, int device_type, unsigned int irq,
+ 		break;
+ 	case S2MPG12:
+ 		sec_devs = s2mpg12_devs;
+-		num_sec_devs = ARRAY_SIZE(s2mpg12_devs);
++		/* without an interrupt, only the first cell: the regulators */
++		num_sec_devs = sec_pmic->irq ? ARRAY_SIZE(s2mpg12_devs) : 1;
+ 		break;
+ 	case S2MPG13:
+ 		sec_devs = s2mpg13_devs;
+diff --git a/drivers/mfd/sec-irq.c b/drivers/mfd/sec-irq.c
+index a957444a8..bc83954ca 100644
+--- a/drivers/mfd/sec-irq.c
++++ b/drivers/mfd/sec-irq.c
+@@ -612,6 +612,8 @@ struct regmap_irq_chip_data *sec_irq_init(struct sec_pmic_dev *sec_pmic)
+ 	case S2MPG11:
+ 		return sec_irq_init_s2mpg1x(sec_pmic);
+ 	case S2MPG12:
++		if (!sec_pmic->irq)
++			return NULL;	/* described without one: LDOs only */
+ 		return sec_irq_init_s2mpg12(sec_pmic);
+ 	case S2MPG13:
+ 		/* No interrupt line described for it yet: LDOs only. */
+diff --git a/drivers/regulator/s2mps11.c b/drivers/regulator/s2mps11.c
+index 84a32854d..4462c704e 100644
+--- a/drivers/regulator/s2mps11.c
++++ b/drivers/regulator/s2mps11.c
+@@ -19,6 +19,7 @@
+ #include <linux/mfd/samsung/core.h>
+ #include <linux/mfd/samsung/s2mpg10.h>
+ #include <linux/mfd/samsung/s2mpg11.h>
++#include <linux/mfd/samsung/s2mpg12.h>
+ #include <linux/mfd/samsung/s2mpg13.h>
+ #include <linux/mfd/samsung/s2mps11.h>
+ #include <linux/mfd/samsung/s2mps13.h>
+@@ -2169,6 +2170,36 @@ static const struct regulator_desc s2mpg13_regulators[] = {
+ 	regulator_desc_s2mpg13_ldo_own(28, 7, BIT(7)),
+ };
+ 
++/*
++ * S2MPG12 (gs201 main PMIC): only the touchscreen's LDO25M and LDO26M, from
++ * Google's GPL s2mpg12-regulator.c. Each is switched from its own control
++ * register, above a 6-bit selector; LDO26M's enable field is two bits wide
++ * (an operating mode, "on" is 0b11), as on S2MPG13. The ops are S2MPG13's.
++ */
++#define regulator_desc_s2mpg12_ldo(_num, _g, _en_mask) {			\
++	.name		= "ldo"#_num"m",					\
++	.id		= S2MPG12_LDO##_num,					\
++	.of_match	= of_match_ptr("ldo"#_num"m"),				\
++	.regulators_node = of_match_ptr("regulators"),				\
++	.ops		= &s2mpg13_ldo_ops,					\
++	.type		= REGULATOR_VOLTAGE,					\
++	.owner		= THIS_MODULE,						\
++	.min_uV		= S2MPG12_LDO_MIN_G##_g,				\
++	.uV_step	= S2MPG12_LDO_STEP_G##_g,				\
++	.n_voltages	= 64,							\
++	.vsel_reg	= S2MPG12_PMIC_L##_num##M_CTRL,				\
++	.vsel_mask	= 64 - 1,						\
++	.enable_reg	= S2MPG12_PMIC_L##_num##M_CTRL,				\
++	.enable_mask	= _en_mask,						\
++	.enable_val	= _en_mask,						\
++	.enable_time	= S2MPG12_LDO_ENABLE_TIME,				\
++}
++
++static const struct regulator_desc s2mpg12_regulators[] = {
++	regulator_desc_s2mpg12_ldo(25, 4, BIT(7)),
++	regulator_desc_s2mpg12_ldo(26, 5, GENMASK(7, 6)),
++};
++
+ static const struct regulator_desc s2mpu05_regulators[] = {
+ 	regulator_desc_s2mpu05_ldo4(1, CTRL),
+ 	regulator_desc_s2mpu05_ldo3(2, CTRL),
+@@ -2259,6 +2290,11 @@ static int s2mps11_pmic_probe(struct platform_device *pdev)
+ 		s2mpg1x_regulators = s2mpg11_regulators;
+ 		BUILD_BUG_ON(ARRAY_SIZE(s2mpg11_regulators) > S2MPS_REGULATOR_MAX);
+ 		break;
++	case S2MPG12:
++		rdev_num = ARRAY_SIZE(s2mpg12_regulators);
++		regulators = s2mpg12_regulators;
++		BUILD_BUG_ON(ARRAY_SIZE(s2mpg12_regulators) > S2MPS_REGULATOR_MAX);
++		break;
+ 	case S2MPG13:
+ 		rdev_num = ARRAY_SIZE(s2mpg13_regulators);
+ 		regulators = s2mpg13_regulators;
+@@ -2345,6 +2381,7 @@ static int s2mps11_pmic_probe(struct platform_device *pdev)
+ static const struct platform_device_id s2mps11_pmic_id[] = {
+ 	{ .name = "s2mpg10-regulator", .driver_data = S2MPG10 },
+ 	{ .name = "s2mpg11-regulator", .driver_data = S2MPG11 },
++	{ .name = "s2mpg12-regulator", .driver_data = S2MPG12 },
+ 	{ .name = "s2mpg13-regulator", .driver_data = S2MPG13 },
+ 	{ .name = "s2mps11-regulator", .driver_data = S2MPS11X },
+ 	{ .name = "s2mps13-regulator", .driver_data = S2MPS13X },
+diff --git a/include/linux/mfd/samsung/s2mpg12.h b/include/linux/mfd/samsung/s2mpg12.h
+index e2b71c1ee..d91371a1b 100644
+--- a/include/linux/mfd/samsung/s2mpg12.h
++++ b/include/linux/mfd/samsung/s2mpg12.h
+@@ -53,9 +53,29 @@ enum s2mpg12_pmic_reg {
+ 	S2MPG12_PMIC_BUCHG,
+ 	S2MPG12_PMIC_RTCBUF,
+ 	S2MPG12_PMIC_CTRL1,
++	S2MPG12_PMIC_L25M_CTRL = 0x44,
++	S2MPG12_PMIC_L26M_CTRL,
+ 	S2MPG12_PMIC_SW_RESET = 0xec,
+ };
+ 
++/*
++ * The LDOs that have a driver so far: the touchscreen's (TSP_DVDD and
++ * TS_AVDD on the Pixel 7 and 7 Pro). Voltage groups and enable fields from
++ * Google's GPL s2mpg12-regulator.c.
++ */
++enum s2mpg12_regulators {
++	S2MPG12_LDO25,
++	S2MPG12_LDO26,
++	S2MPG12_REGULATOR_MAX,
++};
++
++#define S2MPG12_LDO_MIN_G4		700000
++#define S2MPG12_LDO_STEP_G4		25000
++#define S2MPG12_LDO_MIN_G5		1800000
++#define S2MPG12_LDO_STEP_G5		25000
++
++#define S2MPG12_LDO_ENABLE_TIME		128	/* us */
++
+ /* S2MPG12_PMIC_STATUS2 */
+ #define S2MPG12_STATUS2_RTCA1E		BIT(1)
+ #define S2MPG12_STATUS2_RTCA0E		BIT(2)

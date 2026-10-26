@@ -1,0 +1,37 @@
+# ztOSIAL manifest: Google Pixel 7 (panther), Tensor G2 (gs201), on mainline
+# Linux (omarchy-mobile's kernel with ztOS's board file, kernel/panther/).
+# Generic backends everywhere. Not there yet, and so hidden by ztOS: the
+# battery and charger, cpufreq (ACPM DVFS), thermal zones, haptics, the
+# modem. The AoC's sensors are iio-sensor-proxy's D-Bus API (omamobile-sensors),
+# not IIO devices.
+
+[device]
+codename = "google-panther"
+name = "Google Pixel 7"
+form_factor = "phone"
+scale = 3.0
+
+[gsi]
+min = "0.2.0"
+
+[ial.Display1]
+backend = "generic"
+node = "/sys/class/backlight/1c2c0000.dsi.0"
+
+[ial.Perf1]
+backend = "generic"
+gpu_devfreq = "/sys/class/devfreq/28000000.gpu"
+# no cpufreq and no zrn-hotplug: every core stays online
+keep_online = [0, 1, 2, 3, 4, 5, 6, 7]
+hotplug = false
+
+[ial.Android1]
+backend = "generic"
+
+[android]
+binder = "binderfs"
+gralloc = "gbm"
+memory_budget_mb = 2048
+
+[boot]
+usb_gadget_udc = "11210000.usb"

@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Empty board overlay for the Pixel 7 (panther) bootloader (ABL).
+ *
+ * ABL picks a dtbo entry by board_id/board_rev (this phone: cdt_hwid
+ * 0x30406 rev 0x10000, stock dtbo_idx 22, "PANTHER MP") and applies it on
+ * top of our base DTB. The stock overlay refers to Google labels the
+ * mainline DTB does not have, so we ship one that changes nothing.
+ */
+/dts-v1/;
+/plugin/;
+
+/ {
+	board_id = <0x30406>;
+	board_rev = <0x10000>;
+
+	fragment@0 {
+		target-path = "/";
+		__overlay__ {
+		};
+	};
+};

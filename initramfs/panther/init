@@ -1,0 +1,296 @@
+#!/bin/sh
+# zboot: boot stage for the Pixel 7 (panther) on a mainline kernel.
+#
+# ztOS lives on slot A (boot images) and USERDATA (the Arch root, label
+# ZR_ARCH); stock Android stays on slot B. Nothing here ever marks slot A
+# successful, so every start that does not reach a working system uses up
+# one of ABL's retries, and when they run out ABL starts stock on slot B.
+#
+# Kernel command line:
+#   zboot.rescue=1     do not boot anything, stay in the rescue shell
+#   zboot.deadman=N    reboot N seconds after boot unless /run/zboot.hold
+#                      exists (0 = never; default 600)
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+/bin/busybox --install -s /bin 2>/dev/null
+mkdir -p /proc /sys /dev /run /tmp /newroot
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mount -t tmpfs -o mode=755 tmpfs /run
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts 2>/dev/null
+
+echo 1 > /proc/sys/kernel/sysrq
+
+LOG=/run/zboot.log
+log() {
+	echo "zboot| $*" > /dev/kmsg 2>/dev/null
+	echo "$(cut -d' ' -f1 /proc/uptime) $*" >> "$LOG"
+	echo "zboot: $*" > /dev/tty0 2>/dev/null
+}
+
+arg() {
+	sed -n "s/.*\b$1=\([^ ]*\).*/\1/p" /proc/cmdline
+}
+
+# --- storage guard: before anything else -------------------------------------
+# The UFS holds what cannot be made again (efs, persist, modem_userdata: the
+# IMEI and the calibration) and stock Android on slot B. Every disk and
+# partition is set read-only as soon as it appears, except the ones ztOS
+# owns: slot A's boot images and USERDATA. The whole-disk node of sda is
+# removed, so nothing writes across partitions; the boot LUNs (sdb, sdc,
+# sdd: the bootloaders) are read-only at the disk level. The loop keeps
+# running until the handover; the read-only flags stay set after it.
+UFS_RW="boot_a init_boot_a vendor_boot_a vendor_kernel_boot_a dtbo_a userdata"
+mkdir -p /run/ufs-ro
+partname() { sed -n 's/^PARTNAME=//p' "$1/uevent" 2>/dev/null; }
+guard_pass() {
+	for s in /sys/block/sd* /sys/block/sd*/sd*; do
+		[ -r "$s/ro" ] || continue
+		name=${s##*/}
+		[ -e "/run/ufs-ro/$name" ] && continue
+		[ -b "/dev/$name" ] || continue
+		if [ "$name" = sda ]; then
+			rm -f /dev/sda
+			: > /run/ufs-ro/sda
+			continue
+		fi
+		part=$(partname "$s")
+		if [ -n "$part" ] && [ "${name%%[0-9]*}" = sda ]; then
+			case " $UFS_RW " in *" $part "*)
+				: > "/run/ufs-ro/$name"
+				echo "zboot| ufs: $name ($part) writable" > /dev/kmsg
+				continue ;;
+			esac
+		fi
+		blockdev --setro "/dev/$name"
+		if [ "$(cat "$s/ro")" = 1 ]; then
+			: > "/run/ufs-ro/$name"
+		elif [ ! -e "/run/ufs-ro/$name.failed" ]; then
+			: > "/run/ufs-ro/$name.failed"
+			log "WARNING: could not set $name${part:+ ($part)} read-only"
+		fi
+	done
+}
+# What is writable and should not be (empty: the guard holds)
+guard_open() {
+	for s in /sys/block/sd* /sys/block/sd*/sd*; do
+		[ -r "$s/ro" ] || continue
+		name=${s##*/}
+		[ "$name" = sda ] && continue
+		[ "$(cat "$s/ro")" = 0 ] || continue
+		part=$(partname "$s")
+		if [ -n "$part" ] && [ "${name%%[0-9]*}" = sda ]; then
+			case " $UFS_RW " in *" $part "*) continue ;; esac
+		fi
+		echo "$name${part:+ ($part)}"
+	done
+}
+guard_pass
+( while :; do guard_pass; sleep 0.2; done ) &
+GUARD=$!
+
+log "===== zboot on $(uname -r), $(cat /proc/device-tree/model 2>/dev/null) ====="
+log "cpus online: $(cat /sys/devices/system/cpu/online)  mem: $(awk '/MemTotal/{printf "%d MB", $2/1024}' /proc/meminfo)"
+
+# --- the screen ----------------------------------------------------------------
+# The panel is in command mode: it takes a frame only when DECON0 sends one,
+# and ABL masks that trigger after its logo. Unmasking it (TRIG_CON: clear
+# HW_TRIG_MASK_DECON, set HW_TRIG_EN) lets the bootloader's framebuffer,
+# now simplefb, reach the panel. Only on this board.
+if [ "$(tr '\0' '\n' < /proc/device-tree/compatible | head -n1)" = google,gs201-panther ]; then
+	devmem 0x1c240030 0x3061 > /dev/null 2>&1 || log "DECON0 trigger: devmem failed"
+fi
+[ -f /splash.raw.gz ] && zcat /splash.raw.gz > /dev/fb0 2>/dev/null
+
+# --- deadman -------------------------------------------------------------------
+DEADMAN=$(arg zboot.deadman)
+DEADMAN=${DEADMAN:-600}
+EARLY_DEADMAN=
+if [ "$DEADMAN" -gt 0 ] 2>/dev/null; then
+	log "deadman: reboot in $DEADMAN s unless /run/zboot.hold exists"
+	(
+		sleep "$DEADMAN"
+		[ -e /run/zboot.hold ] && exit 0
+		echo "zboot| deadman fired in the boot stage" > /dev/kmsg 2>/dev/null
+		echo b > /proc/sysrq-trigger 2>/dev/null
+	) &
+	EARLY_DEADMAN=$!
+fi
+
+late_deadman() {
+	[ -n "$EARLY_DEADMAN" ] || return 0
+	kill "$EARLY_DEADMAN" 2>/dev/null
+	(
+		cd /newroot || exit 0
+		sleep "$DEADMAN"
+		[ -e run/zboot.hold ] && exit 0
+		echo "zboot| deadman fired after handover" > dev/kmsg 2>/dev/null
+		echo b > proc/sysrq-trigger 2>/dev/null
+	) &
+	log "deadman re-armed for the new root: touch /run/zboot.hold within $DEADMAN s"
+}
+
+# --- USB: NCM network + ACM serial, telnet on 172.16.42.1 ----------------------
+usb_up() {
+	mount -t configfs none /sys/kernel/config 2>/dev/null
+	g=/sys/kernel/config/usb_gadget/zboot
+	[ -d "$g" ] && return 0
+	i=0
+	while [ -z "$(ls /sys/class/udc 2>/dev/null)" ] && [ "$i" -lt 120 ]; do
+		i=$((i + 1))
+		sleep 0.25
+	done
+	udc=$(ls /sys/class/udc 2>/dev/null | head -n1)
+	if [ -z "$udc" ]; then
+		log "usb: no UDC"
+		return 1
+	fi
+	mkdir -p "$g" || return 1
+	echo 0x1d6b > "$g/idVendor"
+	echo 0x0104 > "$g/idProduct"
+	mkdir -p "$g/strings/0x409" "$g/configs/c.1/strings/0x409"
+	echo "zboot" > "$g/strings/0x409/manufacturer"
+	echo "Pixel 7 zboot rescue" > "$g/strings/0x409/product"
+	echo "panther" > "$g/strings/0x409/serialnumber"
+	echo "ncm+acm" > "$g/configs/c.1/strings/0x409/configuration"
+	mkdir -p "$g/functions/ncm.usb0" "$g/functions/acm.GS0"
+	echo 02:5a:42:00:00:01 > "$g/functions/ncm.usb0/dev_addr"
+	echo 02:5a:42:00:00:02 > "$g/functions/ncm.usb0/host_addr"
+	ln -s "$g/functions/ncm.usb0" "$g/configs/c.1/"
+	ln -s "$g/functions/acm.GS0" "$g/configs/c.1/"
+	echo "$udc" > "$g/UDC" || { log "usb: binding $udc failed"; return 1; }
+	ifconfig lo 127.0.0.1 up
+	ifconfig usb0 172.16.42.1 netmask 255.255.255.0 up
+	# no router and no DNS option: the host must not route anything this way
+	mkdir -p /var/lib/misc /etc
+	: > /var/lib/misc/udhcpd.leases
+	cat > /etc/udhcpd.conf <<-EOF
+		start 172.16.42.2
+		end 172.16.42.2
+		interface usb0
+		max_leases 1
+		option subnet 255.255.255.0
+		option lease 3600
+	EOF
+	udhcpd /etc/udhcpd.conf
+	telnetd -l /bin/sh -p 23
+	( while :; do setsid getty -n -l /bin/sh 115200 ttyGS0 vt100; sleep 1; done ) &
+	log "usb: $udc bound, telnet on 172.16.42.1"
+}
+
+# A computer that never configures the gadget means nobody can reach us:
+# reboot, so ABL's retries run down towards stock on slot B.
+usb_watch() {
+	(
+		i=0
+		while [ "$i" -lt 90 ]; do
+			# somebody can reach the rescue shell: the deadman stands down
+			grep -qx configured /sys/class/udc/*/state 2>/dev/null && { touch /run/zboot.hold; exit 0; }
+			i=$((i + 1))
+			sleep 1
+		done
+		[ -e /run/zboot.hold ] && exit 0
+		echo "zboot| usb never configured: rebooting" > /dev/kmsg
+		echo "zboot: no computer on USB in 90 s, rebooting" > /dev/tty0 2>/dev/null
+		sleep 10
+		echo b > /proc/sysrq-trigger
+	) &
+}
+
+# First light, no keyboard and no touch: when USB does not come up, the
+# screen is the only way out, so show why there (zboot.diag=1 on the command
+# line keeps it on the screen and the phone from rebooting).
+diag() {
+	mkdir -p /sys/kernel/debug
+	mount -t debugfs none /sys/kernel/debug 2>/dev/null
+	{
+		echo
+		echo "=== zboot diag $(cut -d' ' -f1 /proc/uptime)s: $*"
+		echo "udc: $(ls /sys/class/udc 2>/dev/null) state: $(cat /sys/class/udc/*/state 2>/dev/null)"
+		echo "--- deferred probes ---"
+		cat /sys/kernel/debug/devices_deferred 2>/dev/null | head -12
+		echo "--- usb/phy/dwc3 in dmesg ---"
+		dmesg | grep -iE 'dwc3|11210000|11200000|usb|udc|phy|gadget' | tail -14
+		echo "--- errors ---"
+		dmesg | grep -iE 'fail|error|unable|timeout' | grep -v 'zboot' | tail -8
+	} > /run/zboot.diag 2>&1
+	cat /run/zboot.diag > /dev/tty0 2>/dev/null
+	cat /run/zboot.diag > /dev/kmsg 2>/dev/null
+}
+
+rescue() {
+	log "rescue shell: $*"
+	if [ "$(arg zboot.diag)" = 1 ]; then
+		grep -qx configured /sys/class/udc/*/state 2>/dev/null || diag "$*"
+		touch /run/zboot.hold
+		while :; do sleep 3600; done
+	fi
+	usb_watch
+	cp "$LOG" /run/zboot.rescue 2>/dev/null
+	while :; do
+		setsid sh -c 'exec sh -i </dev/tty0 >/dev/tty0 2>&1'
+		sleep 1
+	done
+}
+
+# USB first, before anything that may fail: it is the way in.
+usb_up
+
+[ "$(arg zboot.rescue)" = 1 ] && rescue "requested on the command line"
+
+# --- find and boot the Arch root ----------------------------------------------
+# USERDATA, by its GPT name, carrying ext4 labelled ZR_ARCH
+i=0
+ROOTDEV=
+while [ "$i" -lt 40 ]; do
+	for s in /sys/block/sda/sda*; do
+		[ "$(partname "$s")" = userdata ] && ROOTDEV=/dev/${s##*/}
+	done
+	[ -n "$ROOTDEV" ] && break
+	i=$((i + 1))
+	sleep 0.25
+done
+log "block devices after $i tries: $(echo $(ls /sys/class/block 2>/dev/null | grep -v '^ram\|^loop' | tr '\n' ' '))"
+[ -n "$ROOTDEV" ] || rescue "no userdata partition"
+[ "$(findfs LABEL=ZR_ARCH 2>/dev/null)" = "$ROOTDEV" ] || rescue "userdata ($ROOTDEV) is not labelled ZR_ARCH"
+
+log "ZR_ARCH is $ROOTDEV"
+mount -t ext4 -o ro "$ROOTDEV" /newroot || rescue "mount of $ROOTDEV failed"
+[ -x /newroot/sbin/init ] || [ -L /newroot/sbin/init ] || {
+	umount /newroot
+	rescue "no /sbin/init on ZR_ARCH"
+}
+
+# Last check while telnet still runs: nothing outside the allowlist writable
+guard_pass
+OPEN=$(guard_open)
+if [ -n "$OPEN" ]; then
+	umount /newroot
+	rescue "writable outside the allowlist: $(echo $OPEN)"
+fi
+kill "$GUARD" 2>/dev/null
+
+# The gadget goes with the initramfs: the root system builds its own.
+if [ -d /sys/kernel/config/usb_gadget/zboot ]; then
+	killall telnetd udhcpd getty 2>/dev/null
+	g=/sys/kernel/config/usb_gadget/zboot
+	echo "" > "$g/UDC" 2>/dev/null
+	rm -f "$g/configs/c.1/ncm.usb0" "$g/configs/c.1/acm.GS0"
+	rmdir "$g/configs/c.1/strings/0x409" "$g/configs/c.1" \
+		"$g/functions/ncm.usb0" "$g/functions/acm.GS0" \
+		"$g/strings/0x409" "$g" 2>/dev/null
+fi
+
+log "switch_root to $ROOTDEV"
+dmesg > /run/zboot.dmesg 2>/dev/null
+late_deadman
+mount --move /proc /newroot/proc
+mount --move /sys /newroot/sys
+mount --move /dev /newroot/dev
+mount --move /run /newroot/run
+exec switch_root /newroot /sbin/init
+
+echo "zboot| switch_root failed" > /dev/kmsg
+exec sh -i </dev/console >/dev/console 2>&1

@@ -35,7 +35,7 @@ class Fail(Exception):
 
 @dataclass
 class Settings:
-    target: str = "qemu"            # qemu | starlte | gsi (the generic system alone, as a tarball)
+    target: str = "qemu"            # qemu | starlte | panther | gsi (the generic system alone, as a tarball)
     user: str = "ztos"
     password: str = "ztos"
     hostname: str = "ztos"
@@ -54,7 +54,7 @@ def say(*words):
 
 # a target's device layer (devices/<dir>/: manifest, layer.sh, packages.txt);
 # the GSI has none (design/ztOSIAL.md)
-DEVICES = {"starlte": "samsung-starlte", "qemu": "qemu-virt"}
+DEVICES = {"starlte": "samsung-starlte", "panther": "google-panther", "qemu": "qemu-virt"}
 
 
 def gsi_version() -> str:
@@ -76,10 +76,13 @@ def packages(target: str) -> list:
     return names
 
 
-def check_host():
-    """What building needs on this computer."""
+def check_host(target: str = "qemu"):
+    """What building needs on this computer (the FAT tools: only the emulator's disk)."""
     missing = []
-    for tool in ("unshare", "newuidmap", "bsdtar", "mkfs.fat", "mcopy", "mmd", "sfdisk", "python3"):
+    tools = ["unshare", "newuidmap", "bsdtar", "sfdisk", "python3"]
+    if target == "qemu":
+        tools += ["mkfs.fat", "mcopy", "mmd"]
+    for tool in tools:
         if shutil.which(tool) is None:
             missing.append(tool)
     if not Path("/usr/bin/mke2fs").exists() and not Path("/usr/sbin/mke2fs").exists():
@@ -154,8 +157,17 @@ mount --bind "$PKGCACHE" "$R/var/cache/pacman/pkg"
 rm -f "$R/etc/resolv.conf"; cp -L /etc/resolv.conf "$R/etc/resolv.conf"
 ch() { chroot "$R" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/bin HOME=/root LANG=C.UTF-8 "$@"; }
 P="pacman --disable-sandbox --noconfirm"
+# Units are switched on from outside the chroot where the host has systemctl:
+# under qemu-user, aarch64 systemctl crashes in this PID namespace (SIGSEGV).
+sc() {
+	if command -v systemctl > /dev/null 2>&1; then
+		systemctl --root="$R" "$@"
+	else
+		ch systemctl "$@"
+	fi
+}
 
-if [ "$TARGET" = starlte ]; then
+if [ "$TARGET" = starlte ] || [ "$TARGET" = panther ]; then
 	# the kernel is ztOS's own boot image there, never a package
 	sed -i 's/^#\?IgnorePkg *=.*/IgnorePkg   = linux-aarch64 linux-aarch64-headers/' "$R/etc/pacman.conf"
 fi
@@ -198,22 +210,22 @@ done
 # before ztMETRO: the shell links libztos-ial
 step "installing ztOSIAL (the hardware interfaces)"
 rm -rf "$R/usr/src/ztos-ial"; mkdir -p "$R/usr/src"
-cp -a "$SRC/ial" "$R/usr/src/ztos-ial"
+cp -a --no-preserve=ownership "$SRC/ial" "$R/usr/src/ztos-ial"
 sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$GSIVERSION\"/" "$R/usr/src/ztos-ial/gsi.json"
 ch sh -c 'cd /usr/src/ztos-ial && make clean >/dev/null 2>&1; make && make install PREFIX=/usr'
 rm -rf "$R/usr/src/ztos-ial"
 
 step "building ztMETRO and its apps"
 rm -rf "$R/usr/src/ztmetro"; mkdir -p "$R/usr/src"
-cp -a "$SRC/ztmetro" "$R/usr/src/ztmetro"
+cp -a --no-preserve=ownership "$SRC/ztmetro" "$R/usr/src/ztmetro"
 rm -rf "$R/usr/src/ztmetro/ref"
 ch sh -c 'cd /usr/src/ztmetro && make clean >/dev/null 2>&1; make -j"$(nproc)" && make install'
 ch sh -c 'cd /usr/src/ztmetro && make install-browser'
 ch sh -c 'cd /usr/src/ztmetro && make clean >/dev/null 2>&1' || true
 
 step "adding ztOS's files"
-cp -a "$SRC/os/overlay/." "$R/"
-cp -a "$SRC/rootfs/overlay/." "$R/"         # every phone's: USB link, session, memory and fs recovery
+cp -a --no-preserve=ownership "$SRC/os/overlay/." "$R/"
+cp -a --no-preserve=ownership "$SRC/rootfs/overlay/." "$R/"         # every phone's: USB link, session, memory and fs recovery
 ch update-desktop-database /usr/share/applications
 
 step "adding Android (Waydroid and the recipe for its image)"
@@ -223,7 +235,7 @@ for f in install.sh strip-image.sh patch-vendor.sh patch-composer.py waydroid.cf
 		audio-recover.py launch.sh power.sh ztos-waydroid-boot README.md \
 		ztos-waydroid-network.service ztos-waydroid-session.service ztos-waydroid-boot.service \
 		ztos-waydroid-audio-reconnect.service; do
-	[ -e "$SRC/android/waydroid/$f" ] && cp -a "$SRC/android/waydroid/$f" "$W/"
+	[ -e "$SRC/android/waydroid/$f" ] && cp -a --no-preserve=ownership "$SRC/android/waydroid/$f" "$W/"
 done
 install -Dm755 "$SRC/android/waydroid/ztos-waydroid-images" "$R/usr/lib/ztos/ztos-waydroid-images"
 install -Dm644 "$SRC/android/waydroid/ztos-waydroid-images.service" \
@@ -239,7 +251,7 @@ ch fc-cache -f > /dev/null 2>&1 || true
 
 step "installing the ztOS SDK"
 rm -rf "$R/usr/local/lib/ztos-sdk"; mkdir -p "$R/usr/local/lib"
-cp -a "$SRC/sdk" "$R/usr/local/lib/ztos-sdk"
+cp -a --no-preserve=ownership "$SRC/sdk" "$R/usr/local/lib/ztos-sdk"
 ln -sf ../lib/ztos-sdk/bin/ztos-sdk "$R/usr/local/bin/ztos-sdk"
 S=$R/etc/skel/.local/share/ztos
 install -Dm644 "$SRC/sdk/runtime/zygote.py" "$S/zygote.py"
@@ -300,13 +312,17 @@ step "turning on ztOS's services"
 # (systemd-pstore: the kernel log of a crash or hang is kept in /var/lib/systemd/pstore)
 for u in greetd NetworkManager systemd-resolved sshd systemd-pstore ztos-pstore-keep ztoscoresensorframework ztos-update-check.timer \
 		ztos-iald waydroid-container ztos-waydroid-images; do
-	ch systemctl enable "$u" > /dev/null 2>&1
+	sc enable "$u" > /dev/null 2>&1 || echo "(could not enable $u)"
+done
+# the user session's sound (Arch only presets them; with no preset run they stay off)
+for u in pipewire.socket pipewire-pulse.socket wireplumber.service; do
+	sc --global enable "$u" > /dev/null 2>&1 || echo "(could not enable $u for users)"
 done
 for u in systemd-networkd getty@tty1; do
-	ch systemctl disable "$u" > /dev/null 2>&1 || true
+	sc disable "$u" > /dev/null 2>&1 || true
 done
 for u in $DEVICE_UNITS; do
-	ch systemctl enable "$u" > /dev/null 2>&1 || echo "(no $u)"
+	sc enable "$u" > /dev/null 2>&1 || echo "(no $u)"
 done
 
 step "tidying up"
@@ -336,7 +352,7 @@ fi
 step "writing the system image"
 # Re-arm first boot even when building from a previously used root tree.
 # The image filesystem is smaller than the phone's USERDATA partition.
-if [ "$TARGET" = starlte ]; then
+if [ "$TARGET" = starlte ] || [ "$TARGET" = panther ]; then
 	touch "$R/etc/zboot-firstboot"
 fi
 umount -l "$R/var/cache/pacman/pkg" 2>/dev/null || true
@@ -360,7 +376,8 @@ def run_stage(s: Settings, log: Path) -> None:
         "TARGET": s.target, "PACKAGES": " ".join(packages(s.target)), "USERNAME": s.user,
         "PASSWORD": s.password, "HOSTNAME": s.hostname, "TIMEZONE": s.timezone, "FRESH": "1" if s.fresh else "0",
         "ROOTIMG": str(s.dir / "root.img"), "SIZE": str(s.size_gb), "MKE2FS": mke2fs,
-        "LABEL": "ZR_ARCH" if s.target == "starlte" else "ztos-root",
+        "LABEL": "ZR_ARCH" if s.target in ("starlte", "panther") else "ztos-root",
+        "KMODS": str(panther_modules()) if s.target == "panther" else "",
         "PKGCACHE": str(PKGCACHE),
         "DEVDIR": DEVICES.get(s.target, ""), "GSIVERSION": gsi_version(),
         # the device layer: devices/<dir> here; after the repository split, a
@@ -479,8 +496,27 @@ def make_qemu_disk(s: Settings) -> Path:
     return disk
 
 
+def panther_modules() -> Path:
+    """The Pixel 7 kernel's modules, installed into a directory of their own
+    (the kernel itself is in the boot image: scripts/build-boot-panther.sh)."""
+    out = ROOT / "build" / "out-panther"
+    stage = ROOT / "build" / "panther-modules"
+    if not (out / "modules.order").exists():
+        raise Fail("the Pixel 7 kernel's modules are not built: scripts/build-boot-panther.sh, then "
+                   "make -C build/linux-omamobile O=../out-panther modules")
+    tc = ROOT / "build" / "toolchain" / "arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu" / "bin"
+    env = dict(os.environ, ARCH="arm64", CROSS_COMPILE="aarch64-none-linux-gnu-",
+               PATH=f"{ROOT / 'build' / 'host' / 'usr' / 'bin'}:{tc}:{os.environ.get('PATH', '')}")
+    shutil.rmtree(stage, ignore_errors=True)
+    say("installing the Pixel 7 kernel's modules")
+    subprocess.run(["make", "-C", str(ROOT / "build" / "linux-omamobile"), "O=../out-panther",
+                    f"INSTALL_MOD_PATH={stage}", "INSTALL_MOD_STRIP=1", "modules_install"],
+                   env=env, check=True, stdout=subprocess.DEVNULL)
+    return stage
+
+
 def build(s: Settings) -> Path:
-    check_host()
+    check_host(s.target)
     fetch_tarball()
     log = s.dir / "build.log"
     rootimg = s.dir / ("ztos-gsi-%s-aarch64.tar.zst" % gsi_version() if s.target == "gsi" else "root.img")

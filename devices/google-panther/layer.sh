@@ -87,4 +87,17 @@ if [ -d "$DEVROOT/build/wallpapers/backgrounds/ztos" ]; then
 fi
 chmod 755 "$R"/usr/local/bin/ztos-* 2>/dev/null || true
 
-DEVICE_UNITS="zboot-usb-gadget ztos-usb-dhcp zboot-firstboot ztos-wifi bluetooth"
+# The boot-success marker (omarchy-mobile's omamobile-device-cheetah, MIT):
+# without it ABL burns a retry each boot and after three goes back to stock
+# on slot B. It sets one bit in devinfo, slot A's "successful" (byte 0x31),
+# and checks that no other byte changed; the user allowed this one write
+# (2026-10-26). A copy of devinfo from before is in build/devinfo-backup/.
+B=$DEVROOT/build/ref/omarchy-mobile/packages/omamobile-device-cheetah
+install -d "$R/usr/src/omamobile-bootctl"
+cp "$B/src/omamobile-bootctl.c" "$R/usr/src/omamobile-bootctl/"
+ch cc -O2 -Wall -o /usr/bin/omamobile-bootctl /usr/src/omamobile-bootctl/omamobile-bootctl.c
+rm -rf "$R/usr/src/omamobile-bootctl"
+install -m755 "$B/bin/omamobile-boot-success" "$R/usr/bin/omamobile-boot-success"
+install -m644 "$B/vendor/systemd/system/omamobile-boot-success.service" "$R/etc/systemd/system/"
+
+DEVICE_UNITS="zboot-usb-gadget ztos-usb-dhcp zboot-firstboot ztos-wifi bluetooth omamobile-boot-success"

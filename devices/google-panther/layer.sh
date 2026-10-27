@@ -93,6 +93,30 @@ EOF
 sed -i 's/\(name = trim_[lr] *label = linear *control = { "Mult" = \)1.0/\10.25/' \
 	"$R/usr/share/pipewire/pipewire.conf.d/60-omamobile-speaker-loudness.conf"
 
+# The cameras (kernel/panther/gs201-panther-camera.dtsi), with omarchy-mobile's
+# loader (omamobile-device-cheetah, MIT): the drivers are blacklisted at boot
+# (overlay/etc/modprobe.d/ztos-camera.conf) and loaded 40 s after it by
+# omamobile-camera.timer, which gives up for good after a start that hung.
+# The sensor and PHY settings are made from the user's own factory image
+# (tools/extract-camera-data-panther) into build/camera-data: never in the repo
+C=$DEVROOT/build/ref/omarchy-mobile/packages/omamobile-device-cheetah
+install -m755 "$C/bin/omamobile-camera-start" "$R/usr/bin/omamobile-camera-start"
+install -m644 "$C/vendor/systemd/system/omamobile-camera.service" \
+	"$C/vendor/systemd/system/omamobile-camera.timer" "$R/etc/systemd/system/"
+install -Dm644 "$C/vendor/udev/rules.d/70-omamobile-dma-heap.rules" "$R/etc/udev/rules.d/70-omamobile-dma-heap.rules"
+# both wait for cheetah's ultrawide link (CSIS 2), which panther leaves off:
+# the main camera's link 1 instead
+sed -i 's|1a460000\.csis|1a450000.csis|' "$R/usr/bin/omamobile-camera-start" \
+	"$R/etc/systemd/system/omamobile-camera.service"
+! grep -q 1a460000 "$R/usr/bin/omamobile-camera-start" "$R/etc/systemd/system/omamobile-camera.service" \
+	|| { echo "omamobile-camera still waits for CSIS 2" >&2; exit 1; }
+if [ -d "$DEVROOT/build/camera-data" ]; then
+	install -d "$R/usr/lib/firmware/omamobile/camera"
+	cp --no-preserve=ownership "$DEVROOT"/build/camera-data/*.bin "$R/usr/lib/firmware/omamobile/camera/"
+else
+	echo "no build/camera-data (tools/extract-camera-data-panther): no cameras" >&2
+fi
+
 # the Windows Phone / Lumia photos, made from the OneDrive zip by os/wallpapers/make-wallpapers.py
 if [ -d "$DEVROOT/build/wallpapers/backgrounds/ztos" ]; then
 	install -d "$R/usr/local/share/backgrounds"
@@ -113,4 +137,4 @@ rm -rf "$R/usr/src/omamobile-bootctl"
 install -m755 "$B/bin/omamobile-boot-success" "$R/usr/bin/omamobile-boot-success"
 install -m644 "$B/vendor/systemd/system/omamobile-boot-success.service" "$R/etc/systemd/system/"
 
-DEVICE_UNITS="zboot-usb-gadget ztos-usb-dhcp zboot-firstboot ztos-wifi bluetooth omamobile-boot-success omamobile-speaker-protection"
+DEVICE_UNITS="zboot-usb-gadget ztos-usb-dhcp zboot-firstboot ztos-wifi bluetooth omamobile-boot-success omamobile-speaker-protection omamobile-camera.timer"

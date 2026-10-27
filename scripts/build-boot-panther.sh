@@ -51,7 +51,8 @@ done
 
 # --- kernel ---------------------------------------------------------------------
 DTS=$SRC/arch/arm64/boot/dts/exynos/google
-cp "$ROOT/kernel/panther/gs201-panther.dts" "$ROOT/kernel/panther/gs201-panther-audio.dtsi" "$DTS/"
+cp "$ROOT/kernel/panther/gs201-panther.dts" "$ROOT/kernel/panther/gs201-panther-audio.dtsi" \
+	"$ROOT/kernel/panther/gs201-panther-camera.dtsi" "$DTS/"
 grep -q gs201-panther.dtb "$DTS/Makefile" || sed -i \
 	-e 's/^\tgs201-cheetah.dtb$/\tgs201-cheetah.dtb \\\n\tgs201-panther.dtb/' \
 	-e 's/^DTC_FLAGS_gs201-cheetah += -@$/&\nDTC_FLAGS_gs201-panther += -@/' "$DTS/Makefile"

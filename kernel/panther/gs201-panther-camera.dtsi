@@ -1,0 +1,377 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Google Pixel 7 (panther) cameras: main (Samsung S5KGN1), ultrawide (Sony
+ * IMX386) and front (Samsung S5K3J1), through omarchy-mobile's CSIS/WDMA,
+ * DC-PHY and sensor drivers (CAMERA-PLAN.md there). Cheetah's nodes
+ * (gs201-cheetah.dts), checked against the stock dtbo's PANTHER MP entry
+ * (board 0x30406) next to its CHEETAH MP one: the same buses, addresses,
+ * reset pins, clocks and power switches, with three differences, all here:
+ *
+ *  - the front camera is powered from the camera PMIC's LDO7 (1.1 V, its
+ *    digital supply) and LDO5 (3.0 V), where cheetah's uses LDO8 and the
+ *    PMIC's switch 4; the order is the driver's (vdig, then vsw);
+ *  - three camera PMIC voltages: LDO3 2.9 V, LDO5 3.0 V, LDO7 1.1 V;
+ *  - the ultrawide has no focus actuator, and there is no telephoto.
+ *
+ * The sensor and PHY settings come from the phone's own camera software
+ * (omarchy-mobile's tools/extract-camera-data), never from the repository:
+ * /usr/lib/firmware/omamobile/camera/. The drivers are kept from loading at
+ * boot (overlay/etc/modprobe.d/ztos-camera.conf) and loaded once the boot
+ * has settled (ztos-camera.service).
+ */
+
+#include <dt-bindings/media/video-interfaces.h>
+
+&{/reserved-memory} {
+	/*
+	 * Capture buffers: the CSIS WDMA takes 32-bit addresses and its
+	 * SysMMU is left in bypass, so frames go to contiguous memory below
+	 * 4 GiB. Reusable: the pages serve movable allocations while no
+	 * camera streams.
+	 */
+	camera_pool: camera-pool {
+		compatible = "shared-dma-pool";
+		reusable;
+		size = <0x8000000>;
+		/* read with the root's #address-cells (2), not #size-cells */
+		alignment = <0x0 0x200000>;
+		alloc-ranges = <0x0 0x80000000 0x80000000>;
+	};
+};
+
+/*
+ * Sub PMIC (S2MPG13): its GPIOs switch the camera power (GPIO0 the camera
+ * PMIC's chip select, GPIO1 PP3200_BB_CAM, GPIO3 PP1300_CAM) and its LDO12S
+ * is every sensor's 1.8 V I/O supply. Only LDO12S is described, so nothing
+ * else on this PMIC can be switched.
+ */
+&acpm_ipc {
+	pmic-2 {
+		compatible = "samsung,s2mpg13-pmic";
+
+		pmic_2_gpio: gpio {
+			compatible = "samsung,s2mpg13-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		regulators {
+			ldo12s: ldo12s {
+				regulator-name = "vddio_cam";
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+			};
+		};
+	};
+};
+
+/ {
+	pp3200_bb_cam: regulator-pp3200-bb-cam {
+		compatible = "regulator-fixed";
+		regulator-name = "PP3200_BB_CAM";
+		regulator-min-microvolt = <3200000>;
+		regulator-max-microvolt = <3200000>;
+		regulator-enable-ramp-delay = <2000>;
+		gpio = <&pmic_2_gpio 1 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	pp1300_cam: regulator-pp1300-cam {
+		compatible = "regulator-fixed";
+		regulator-name = "PP1300_CAM";
+		regulator-min-microvolt = <1300000>;
+		regulator-max-microvolt = <1300000>;
+		regulator-enable-ramp-delay = <2000>;
+		gpio = <&pmic_2_gpio 3 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+};
+
+/* The camera PMIC (SLG51002) on I2C bus 8, as stock. The haptics share the bus. */
+&usi8 {
+	samsung,mode = <USI_MODE_I2C>;
+	status = "okay";
+};
+
+&hsi2c_8 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	cam_pmic: pmic@75 {
+		compatible = "dlg,slg51002";
+		reg = <0x75>;
+		dlg,cs-gpios = <&pmic_2_gpio 0 GPIO_ACTIVE_HIGH>;
+		vin1-2-supply = <&pp3200_bb_cam>;
+		vin3-supply = <&pp3200_bb_cam>;
+		vin4-supply = <&pp3200_bb_cam>;
+		vin5-supply = <&pp3200_bb_cam>;
+		vin6-supply = <&pp1300_cam>;
+		vin7-supply = <&pp1300_cam>;
+		vin8-supply = <&pp1300_cam>;
+
+		/* stock panther's voltages (LDO3, LDO5 and LDO7 differ from cheetah's) */
+		regulators {
+			cam_ldo1: ldo1 {
+				regulator-name = "vdda_main";
+				regulator-min-microvolt = <2850000>;
+				regulator-max-microvolt = <2850000>;
+			};
+
+			cam_ldo2: ldo2 {
+				regulator-name = "vdda_uw";
+				regulator-min-microvolt = <2850000>;
+				regulator-max-microvolt = <2850000>;
+			};
+
+			cam_ldo3: ldo3 {
+				regulator-name = "vdd_main_ois";
+				regulator-min-microvolt = <2900000>;
+				regulator-max-microvolt = <2900000>;
+			};
+
+			cam_ldo4: ldo4 {
+				regulator-name = "vdd_main_af";
+				regulator-min-microvolt = <2900000>;
+				regulator-max-microvolt = <2900000>;
+			};
+
+			cam_ldo5: ldo5 {
+				regulator-name = "vdda_front";
+				regulator-min-microvolt = <3000000>;
+				regulator-max-microvolt = <3000000>;
+			};
+
+			cam_ldo6: ldo6 {
+				regulator-name = "vddd_uw";
+				regulator-min-microvolt = <1100000>;
+				regulator-max-microvolt = <1100000>;
+			};
+
+			cam_ldo7: ldo7 {
+				regulator-name = "vddd_front";
+				regulator-min-microvolt = <1100000>;
+				regulator-max-microvolt = <1100000>;
+			};
+
+			cam_ldo8: ldo8 {
+				regulator-name = "vddd_main";
+				regulator-min-microvolt = <1100000>;
+				regulator-max-microvolt = <1100000>;
+			};
+
+			cam_sw3: sw3 {
+				regulator-name = "cam_sw3";
+			};
+		};
+	};
+};
+
+&pinctrl_peric0 {
+	cam_uw_mclk_on: cam-uw-mclk-on-pins {
+		samsung,pins = "gpp3-0";
+		samsung,pin-function = <GS101_PIN_FUNC_2>;
+		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
+		samsung,pin-drv = <GS101_PIN_DRV_2_5_MA>;
+	};
+
+	cam_front_mclk_on: cam-front-mclk-on-pins {
+		samsung,pins = "gpp5-0";
+		samsung,pin-function = <GS101_PIN_FUNC_2>;
+		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
+		samsung,pin-drv = <GS101_PIN_DRV_2_5_MA>;
+	};
+
+	cam_main_mclk_on: cam-main-mclk-on-pins {
+		samsung,pins = "gpp9-0";
+		samsung,pin-function = <GS101_PIN_FUNC_2>;
+		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
+		samsung,pin-drv = <GS101_PIN_DRV_2_5_MA>;
+	};
+};
+
+&csis_dcphy {
+	/* receive settings, generated from the phone's own camera software */
+	firmware-name = "omamobile/camera/gs201-dcphy.bin";
+	status = "okay";
+};
+
+/*
+ * Main camera: the S5KGN1 at 0x3d on PERIC0 USI1 (I2C bus 1, 1 MHz as
+ * stock), three C-PHY trios to CSIS link 1, with its AK7375-type focus
+ * actuator at 0x0c. Stock power-up: PP3200_BB, PP1300, LDO12S, LDO4, 1 ms,
+ * SLG switch 3, LDO8, LDO1, 2 ms, reset released, 1 ms, MCLK on (CIS_CLK3
+ * on gpp9-0), 9 ms.
+ */
+&usi1 {
+	samsung,mode = <USI_MODE_I2C>;
+	status = "okay";
+};
+
+&hsi2c_1 {
+	clock-frequency = <1000000>;
+	status = "okay";
+
+	main_vcm: lens@c {
+		compatible = "asahi-kasei,ak7375";
+		reg = <0x0c>;
+		vdd-supply = <&cam_ldo4>;
+		vio-supply = <&ldo12s>;
+	};
+
+	camera-sensor@3d {
+		compatible = "samsung,s5kgn1";
+		reg = <0x3d>;
+		clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK3>;
+		assigned-clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK3>;
+		assigned-clock-rates = <24576000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_main_mclk_on>;
+		reset-gpios = <&gpp2 2 GPIO_ACTIVE_LOW>;
+		vbb-supply = <&pp3200_bb_cam>;
+		vbuck-supply = <&pp1300_cam>;
+		vio-supply = <&ldo12s>;
+		vaux-supply = <&cam_ldo4>;
+		vsw-supply = <&cam_sw3>;
+		vdig-supply = <&cam_ldo8>;
+		vana-supply = <&cam_ldo1>;
+		lens-focus = <&main_vcm>;
+		firmware-name = "omamobile/camera/s5kgn1-main.bin";
+		/* the CSIS WDMA drops lines arriving above ~400 MB/s */
+		samsung,max-line-throughput = <360>;
+		orientation = <1>;	/* back */
+		rotation = <90>;
+
+		port {
+			main_out: endpoint {
+				remote-endpoint = <&csis1_in>;
+				bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;
+				data-lanes = <1 2 3>;
+				link-frequencies = /bits/ 64 <931229968>;
+			};
+		};
+	};
+};
+
+&csis1 {
+	memory-region = <&camera_pool>;
+	status = "okay";
+};
+
+&csis1_in {
+	remote-endpoint = <&main_out>;
+	bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;
+	data-lanes = <1 2 3>;
+};
+
+/*
+ * Front camera: the S5K3J1 at 0x10 on PERIC0 USI2 (I2C bus 2, 950 kHz as
+ * stock), four D-PHY lanes to CSIS link 4 (DC-PHY slaves 4 and 5 as one
+ * receiver: cheetah's telephoto link, and panther has no telephoto), fixed
+ * focus. It streams on links 0 and 2 (frame_count at stop) and neither
+ * sees a frame start. Stock power-up on panther: PP3200_BB, PP1300,
+ * LDO12S, LDO7, LDO5, MCLK on (CIS_CLK1 on gpp5-0), reset released
+ * (gpp4-2).
+ */
+&usi2 {
+	samsung,mode = <USI_MODE_I2C>;
+	status = "okay";
+};
+
+&hsi2c_2 {
+	clock-frequency = <950000>;
+	status = "okay";
+
+	camera-sensor@10 {
+		compatible = "samsung,s5k3j1";
+		reg = <0x10>;
+		clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK1>;
+		assigned-clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK1>;
+		assigned-clock-rates = <24576000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_front_mclk_on>;
+		reset-gpios = <&gpp4 2 GPIO_ACTIVE_LOW>;
+		vbb-supply = <&pp3200_bb_cam>;
+		vbuck-supply = <&pp1300_cam>;
+		vio-supply = <&ldo12s>;
+		vdig-supply = <&cam_ldo7>;
+		vsw-supply = <&cam_ldo5>;
+		firmware-name = "omamobile/camera/s5k3j1-front.bin";
+		samsung,max-line-throughput = <360>;
+		orientation = <0>;	/* front */
+		rotation = <90>;
+
+		port {
+			front_out: endpoint {
+				remote-endpoint = <&csis4_in>;
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <832512000>;
+			};
+		};
+	};
+};
+
+&csis4 {
+	memory-region = <&camera_pool>;
+	status = "okay";
+};
+
+&csis4_in {
+	remote-endpoint = <&front_out>;
+	data-lanes = <1 2 3 4>;
+};
+
+/*
+ * Ultrawide: the IMX386 at 0x1a on PERIC0 USI3 (I2C bus 3), four D-PHY
+ * lanes to CSIS link 0, cheetah's front link (on panther the ultrawide
+ * captures there, not on cheetah's link 2, 2026-10-26). Fixed focus on
+ * panther: stock has no actuator for it. MCLK CIS_CLK0 on gpp3-0.
+ */
+&usi3 {
+	samsung,mode = <USI_MODE_I2C>;
+	status = "okay";
+};
+
+&hsi2c_3 {
+	clock-frequency = <950000>;
+	status = "okay";
+
+	camera-sensor@1a {
+		compatible = "sony,imx386";
+		reg = <0x1a>;
+		clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK0>;
+		assigned-clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK0>;
+		assigned-clock-rates = <24576000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_uw_mclk_on>;
+		reset-gpios = <&gpp6 3 GPIO_ACTIVE_LOW>;
+		/* stock's order: PP3200_BB, PP1300, LDO12S, LDO6, LDO2 */
+		vbb-supply = <&pp3200_bb_cam>;
+		vbuck-supply = <&pp1300_cam>;
+		vif-supply = <&ldo12s>;
+		vdig-supply = <&cam_ldo6>;
+		vana-supply = <&cam_ldo2>;
+		firmware-name = "omamobile/camera/imx386-uw.bin";
+		/* 360 still let an odd frame of the 4032x3016 mode drop lines (cheetah) */
+		sony,max-line-throughput = <330>;
+		orientation = <1>;	/* back */
+		rotation = <270>;
+
+		port {
+			uw_out: endpoint {
+				remote-endpoint = <&csis0_in>;
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <774144000>;
+			};
+		};
+	};
+};
+
+&csis0 {
+	memory-region = <&camera_pool>;
+	status = "okay";
+};
+
+&csis0_in {
+	remote-endpoint = <&uw_out>;
+	data-lanes = <1 2 3 4>;
+};

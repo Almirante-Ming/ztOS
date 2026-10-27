@@ -564,3 +564,6 @@
 
 /* The AoC sound card, with the amplifiers above as its TDM 0 codecs */
 #include "gs201-panther-audio.dtsi"
+
+/* The cameras: main, ultrawide and front */
+#include "gs201-panther-camera.dtsi"

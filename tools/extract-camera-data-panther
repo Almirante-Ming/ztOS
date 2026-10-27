@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""
+extract-camera-data-panther: the Pixel 7's sensor and PHY settings, from the
+user's own factory image, into build/camera-data/ (never the repository).
+
+ztOS: runs omarchy-mobile's tools/extract-camera-data (MIT) unchanged, on the
+camera HAL of the factory image (vendor.img > com.google.pixel.camera.hal.apex
+> apex_payload.img > lib64/liblyric_hwl.so). That tool finds each sensor's
+init and mode lists through the virtual table of its driver, at slots it
+knows relative to the model-ID function; the HAL of CP3A.261005 (October
+2026) moved them, so this sets them per sensor:
+
+    S5KGN1 (main)   init -2, modes -5   (the tool's -1, -4)
+    S5K3J1 (front)  init 24, modes 23
+    IMX386 (ultrawide) and the PHY settings: the tool's own search
+
+Usage:
+  tools/extract-camera-data-panther FACTORY.zip [-d build/camera-data]
+
+Needs debugfs (e2fsprogs) and python with unicorn and pyelftools, e.g.
+  python3 -m venv build/host/camvenv
+  build/host/camvenv/bin/pip install unicorn pyelftools
+  build/host/camvenv/bin/python tools/extract-camera-data-panther FACTORY.zip
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import io
+import os
+import subprocess
+import sys
+import tempfile
+import zipfile
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TOOL = os.path.join(ROOT, "build/ref/omarchy-mobile/tools/extract-camera-data")
+APEX = "/apex/com.google.pixel.camera.hal.apex"
+SLOTS = {"s5kgn1": (-2, -5), "s5k3j1": (24, 23)}
+OUTS = {"s5kgn1": "s5kgn1-main.bin", "s5k3j1": "s5k3j1-front.bin", "imx386": "imx386-uw.bin"}
+
+
+def debugfs_dump(image, path, out):
+    subprocess.run(["debugfs", "-R", f"dump {path} {out}", image], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not os.path.getsize(out):
+        sys.exit(f"{path} not found in {image}")
+
+
+def hal_from_factory(factory, work):
+    z = zipfile.ZipFile(factory)
+    inner = [n for n in z.namelist() if os.path.basename(n).startswith("image-")]
+    images = zipfile.ZipFile(io.BytesIO(z.read(inner[0]))) if inner else z
+    vendor = os.path.join(work, "vendor.img")
+    with open(vendor, "wb") as f:
+        f.write(images.read("vendor.img"))
+    apex = os.path.join(work, "hal.apex")
+    debugfs_dump(vendor, APEX, apex)
+    os.unlink(vendor)
+    payload = os.path.join(work, "apex_payload.img")
+    with open(payload, "wb") as f:
+        f.write(zipfile.ZipFile(apex).read("apex_payload.img"))
+    os.unlink(apex)
+    hal = os.path.join(work, "liblyric_hwl.so")
+    debugfs_dump(payload, "/lib64/liblyric_hwl.so", hal)
+    os.unlink(payload)
+    return hal
+
+
+def tool():
+    loader = importlib.machinery.SourceFileLoader("extract_camera_data", TOOL)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("factory", help="panther-*-factory-*.zip (or the image-panther-*.zip in it)")
+    ap.add_argument("-d", "--dir", default=os.path.join(ROOT, "build/camera-data"))
+    args = ap.parse_args()
+    os.makedirs(args.dir, exist_ok=True)
+    with tempfile.TemporaryDirectory() as work:
+        hal = hal_from_factory(args.factory, work)
+        for sensor in ("imx386", "s5kgn1", "s5k3j1"):
+            m = tool()
+            if sensor in SLOTS:
+                m.GN1_SLOT_INIT, m.GN1_SLOT_MODES = SLOTS[sensor]
+            phy = ["--phy-output", os.path.join(args.dir, "gs201-dcphy.bin")] \
+                if sensor == "imx386" else ["--no-phy"]
+            sys.argv = ["extract-camera-data", "--hal", hal, "--sensor", sensor,
+                        "-o", os.path.join(args.dir, OUTS[sensor])] + phy
+            m.main()
+    print("This is data from Google's camera software in your own factory image: "
+          "do not redistribute it.")
+
+
+if __name__ == "__main__":
+    main()

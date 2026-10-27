@@ -156,6 +156,13 @@ static bool demoloop_active(void) {
 #define PAGE_FLICK_V	0.35f	/* points per ms across: a flick, whatever the distance */
 #define EDIT_MS		180
 #define BADGE		32	/* the round buttons on a tile being edited */
+/* the colours a tile can take, over the nav bar while it is edited: "accent"
+ * and the palette, SWATCH_COLS across */
+#define SWATCH_COLS	7
+#define SWATCH_SIDE	40
+#define SWATCH_GAP	6
+#define SWATCH_TOP	34	/* the panel's caption */
+#define SWATCH_BADGE	100
 #define MENU_H		62
 #define MAX_TOUCH	10
 #define MAX_CARDS	8	/* apps in the switcher */
@@ -424,7 +431,8 @@ struct touch_point {
 	bool holding;		/* it has hold of the scrolling */
 	bool dragging;		/* it carries the tile being edited */
 	double gx, gy;		/* where on that tile it took hold */
-	int badge;		/* 1 unpin, 2 resize: the button it went down on */
+	int badge;		/* 1 unpin, 2 resize, 3 colour, 4 search, SWATCH_BADGE + n
+			 * a colour of the palette: the button it went down on */
 };
 
 /* ---- the on-screen keyboard's keys ---------------------------------------- */
@@ -721,11 +729,12 @@ struct zt_server {
 
 	/* rearranging Start: one tile held up, the others standing back */
 	bool editing;
+	bool swatches;		/* the tile being edited shows its colours (draw_swatches) */
 	int edit;
 	float edit_t;
 	struct touch_point *drag_touch;
 	uint32_t reorder_ms;
-	struct zt_layer badge_unpin, badge_grow, badge_shrink;
+	struct zt_layer badge_unpin, badge_grow, badge_shrink, badge_color, swatch_layer;
 	/* the arrow under the tiles, into the list; the list's search */
 	struct zt_layer round_arrow, round_search, search_layer;
 	double arrow_y;		/* the arrow's top, in Start's content */
@@ -7848,10 +7857,11 @@ static void menu_hide(struct zt_server *server) {
 /* ---- rearranging Start ------------------------------------------------------ */
 
 /* The round buttons a tile shows while it is held up: a pin struck through,
- * and an arrow for the next size. */
+ * an arrow for the next size, and a palette for its colour. */
 static void draw_badges(struct zt_server *server) {
-	struct zt_layer *layers[3] = { &server->badge_unpin, &server->badge_grow, &server->badge_shrink };
-	for (int i = 0; i < 3; i++) {
+	struct zt_layer *layers[4] = { &server->badge_unpin, &server->badge_grow, &server->badge_shrink,
+		&server->badge_color };
+	for (int i = 0; i < 4; i++) {
 		cairo_t *cr;
 		struct zt_buffer *buffer = zt_buffer_create(server, BADGE, BADGE, &cr);
 		double c = BADGE / 2.0;
@@ -7877,6 +7887,13 @@ static void draw_badges(struct zt_server *server) {
 			cairo_move_to(cr, 0, -10);
 			cairo_line_to(cr, 0, 10);
 			cairo_stroke(cr);
+		} else if (i == 3) {
+			/* a palette: a ring of four dots */
+			for (int k = 0; k < 4; k++) {
+				double a = k * M_PI / 2 + M_PI / 4;
+				cairo_arc(cr, 5.5 * cos(a), 5.5 * sin(a), 2.6, 0, 2 * M_PI);
+				cairo_fill(cr);
+			}
 		} else {
 			/* down and to the right for larger, back up for small again */
 			if (i == 2) {
@@ -7949,11 +7966,107 @@ static void edit_end(struct zt_server *server) {
 	server->drag_touch = NULL;
 	server->moving = true;
 	animate(server, &server->edit_t, 0.0f, EDIT_MS, 0, false);
+	server->swatches = false;
 	wlr_log(WLR_INFO, "start: editing done");
 }
 
+/* The colour panel's size and place: over the nav bar, the screen's width. */
+static int swatch_count(void) {
+	return 1 + (int)(sizeof(ACCENTS) / sizeof(ACCENTS[0]));	/* "accent", then the palette */
+}
+
+static double swatch_h(void) {
+	int rows = (swatch_count() + SWATCH_COLS - 1) / SWATCH_COLS;
+	return SWATCH_TOP + rows * (SWATCH_SIDE + SWATCH_GAP) + 8;
+}
+
+static double swatch_y(struct zt_server *server) {
+	return server->height - NAV_H - swatch_h();
+}
+
+/* Swatch n's left edge and top, in the panel */
+static void swatch_place(struct zt_server *server, int n, double *x, double *y) {
+	double row_w = SWATCH_COLS * SWATCH_SIDE + (SWATCH_COLS - 1) * SWATCH_GAP;
+	*x = (server->width - row_w) / 2 + (n % SWATCH_COLS) * (SWATCH_SIDE + SWATCH_GAP);
+	*y = SWATCH_TOP + (n / SWATCH_COLS) * (SWATCH_SIDE + SWATCH_GAP);
+}
+
+static const char *swatch_name(int n) {
+	return n == 0 ? "accent" : ACCENTS[n - 1].name;
+}
+
+/* The panel of colours for the tile being edited: Start's own grey, a
+ * caption, "accent" (the theme's, marked A) and the palette; the tile's own
+ * colour has a white frame. */
+static void draw_swatches(struct zt_server *server) {
+	if (server->edit < 0 || server->edit >= server->n_tiles) {
+		return;
+	}
+	struct tile *t = &server->tiles[server->edit];
+	double h = swatch_h();
+	cairo_t *cr;
+	struct zt_buffer *buffer = zt_buffer_create(server, server->width, (int)ceil(h), &cr);
+	cairo_set_source_rgb(cr, 0.17, 0.17, 0.17);
+	cairo_paint(cr);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	double sx, sy;
+	swatch_place(server, 0, &sx, &sy);
+	draw_text(cr, "Tile colour", FONT_REGULAR, 13, sx, 10, 0, 0, false);
+	for (int n = 0; n < swatch_count(); n++) {
+		swatch_place(server, n, &sx, &sy);
+		set_rgb(cr, n == 0 ? server->accent : ACCENTS[n - 1].color);
+		cairo_rectangle(cr, sx, sy, SWATCH_SIDE, SWATCH_SIDE);
+		cairo_fill(cr);
+		if (n == 0) {
+			cairo_set_source_rgb(cr, 1, 1, 1);
+			draw_text(cr, "A", FONT_SEMIBOLD, 16, sx, sy + SWATCH_SIDE / 2.0 - 11, SWATCH_SIDE, 0, true);
+		}
+		if (strcasecmp(t->color_name, swatch_name(n)) == 0) {
+			cairo_set_source_rgb(cr, 1, 1, 1);
+			cairo_set_line_width(cr, 3);
+			cairo_rectangle(cr, sx + 1.5, sy + 1.5, SWATCH_SIDE - 3, SWATCH_SIDE - 3);
+			cairo_stroke(cr);
+		}
+	}
+	zt_buffer_show(server, &server->swatch_layer, buffer, cr, server->width, (int)ceil(h));
+}
+
+/* SWATCH_BADGE + n for the swatch under (x, y), SWATCH_BADGE - 1 elsewhere
+ * on the panel, 0 off it. */
+static int swatch_at(struct zt_server *server, double x, double y) {
+	if (!server->swatches) {
+		return 0;
+	}
+	double top = swatch_y(server);
+	if (y < top || y >= top + swatch_h()) {
+		return 0;
+	}
+	for (int n = 0; n < swatch_count(); n++) {
+		double sx, sy;
+		swatch_place(server, n, &sx, &sy);
+		if (x >= sx - SWATCH_GAP / 2.0 && x < sx + SWATCH_SIDE + SWATCH_GAP / 2.0 &&
+				y - top >= sy - SWATCH_GAP / 2.0 && y - top < sy + SWATCH_SIDE + SWATCH_GAP / 2.0) {
+			return SWATCH_BADGE + n;
+		}
+	}
+	return SWATCH_BADGE - 1;
+}
+
+/* The tile takes swatch n's colour, and keeps it in the tiles file */
+static void tile_recolor(struct zt_server *server, int index, int n) {
+	struct tile *t = &server->tiles[index];
+	snprintf(t->color_name, sizeof(t->color_name), "%s", swatch_name(n));
+	t->color = parse_color(server, t->color_name);
+	draw_tile(server, index);
+	draw_swatches(server);
+	save_tiles(server);
+	hap(server, HAP_CLICK, HG_TILES);
+	damage(server);
+	wlr_log(WLR_INFO, "start: '%s' is now %s", t->label, t->color_name);
+}
+
 /* 1: the unpin button of the tile being edited is under (x, y); 2: its size
- * button; 0: neither. Fingers are wider than the buttons. */
+ * button; 3: its colour button; 0: none. Fingers are wider than the buttons. */
 static int badge_at(struct zt_server *server, double x, double y) {
 	if (!server->editing || server->edit < 0 || server->edit >= server->n_tiles) {
 		return 0;
@@ -7968,6 +8081,10 @@ static int badge_at(struct zt_server *server, double x, double y) {
 	}
 	if (fabs(x - bx) < reach && fabs(y - (cy + t->h / 2 * grow - 4)) < reach) {
 		return 2;
+	}
+	double lx = fmax(cx - t->w / 2 * grow + 4, BADGE / 2.0 + 2);
+	if (fabs(x - lx) < reach && fabs(y - (cy - t->h / 2 * grow + 4)) < reach) {
+		return 3;
 	}
 	return 0;
 }
@@ -8046,6 +8163,7 @@ static void tile_unpin(struct zt_server *server, int index) {
 	server->tapped = -1;
 	/* no tile is held up any more: the others come back at once */
 	server->editing = false;
+	server->swatches = false;
 	server->edit = -1;
 	server->drag_touch = NULL;
 	snap(server, &server->edit_t, 0.0f);
@@ -9076,7 +9194,10 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 				wl_event_source_timer_update(server->long_press_timer, LONG_PRESS_MS);
 			}
 		} else if (server->editing) {
-			p->badge = badge_at(server, x, y);
+			p->badge = swatch_at(server, x, y);
+			if (!p->badge) {
+				p->badge = badge_at(server, x, y);
+			}
 			if (!p->badge && tile_at(server, x, y) == server->edit && !server->drag_touch) {
 				/* the tile that is up: taken hold of again */
 				struct tile *t = &server->tiles[server->edit];
@@ -9495,6 +9616,20 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 				tile_unpin(server, server->edit);
 			} else if (p->badge == 2) {
 				tile_resize(server, server->edit);
+			} else if (p->badge == 3) {
+				hap(server, HAP_TAP, HG_TILES);
+				server->swatches = !server->swatches;
+				if (server->swatches) {
+					draw_swatches(server);
+				}
+				damage(server);
+			} else if (p->badge >= SWATCH_BADGE) {
+				tile_recolor(server, server->edit, p->badge - SWATCH_BADGE);
+			} else if (p->badge == SWATCH_BADGE - 1) {
+				/* between the swatches: nothing */
+			} else if (server->editing && server->swatches) {
+				server->swatches = false;	/* a tap elsewhere: the colours go first */
+				damage(server);
 			} else if (server->editing) {
 				edit_end(server);
 			} else if (p->index >= 0 && p->on_list) {
@@ -10681,7 +10816,7 @@ static void render_frame(struct zt_server *server) {
 			}
 		}
 		if (server->edit_t > 0.3f && server->edit >= 0 && server->edit < n && server->badge_unpin.tex) {
-			/* its two buttons, on its right-hand corners */
+			/* its buttons: two on its right-hand corners, one on its upper left */
 			struct tile *t = &server->tiles[server->edit];
 			float grow = 1.0f + 0.06f * server->edit_t;
 			float cx = (float)(t->x + t->w / 2) + t->off_x + page_dx;
@@ -10692,6 +10827,12 @@ static void render_frame(struct zt_server *server) {
 			layer_draw(server, &server->badge_unpin, bx, cy - (float)t->h / 2 * grow - BADGE / 2.0f + 4, a);
 			layer_draw(server, t->size == TILE_WIDE ? &server->badge_shrink : &server->badge_grow,
 				bx, cy + (float)t->h / 2 * grow - BADGE / 2.0f - 4, a);
+			/* and its colour, on its upper left (the lower left is its name's) */
+			float lx = fmaxf(cx - (float)t->w / 2 * grow + 4 - BADGE / 2.0f, 2);
+			layer_draw(server, &server->badge_color, lx, cy - (float)t->h / 2 * grow - BADGE / 2.0f + 4, a);
+			if (server->swatches && server->swatch_layer.tex) {
+				layer_draw(server, &server->swatch_layer, 0, (float)swatch_y(server), a);
+			}
 		}
 
 		if (server->page > 0.001f) {

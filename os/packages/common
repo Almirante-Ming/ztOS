@@ -62,8 +62,6 @@ mpv
 cava
 nodejs
 npm
-firefox
-chromium
 gnome-terminal
 
 # Android apps: Waydroid (the GSI ships its recipe; ztos-waydroid-images fetches

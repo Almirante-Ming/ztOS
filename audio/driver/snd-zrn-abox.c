@@ -3,7 +3,8 @@
  * snd-zrn-abox: sound for the Galaxy S9 (Exynos 9810) on a mainline kernel.
  *
  * One ALSA card with one playback device, 48 kHz, 16 bit, stereo, out of the
- * phone's two speakers.
+ * phone's two speakers. With capture=1 (off by default, untested on the phone
+ * yet), also the main microphones as hw:0,2: audio/MIC-REA.md.
  *
  * Every sound on this SoC passes through ABOX, an audio block built round a
  * Cortex-A7 that runs Samsung's "calliope" firmware. This driver starts that
@@ -32,6 +33,7 @@
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
+#include <linux/gpio/consumer.h>
 #include <linux/gpio/machine.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
@@ -128,6 +130,12 @@
 #define CP_VSS_PA		0xf7900000UL
 #define CP_VSS_SIZE		0x700000
 #define CP_VSS_MAGIC		0x600000
+/* The voice firmware's parameters, in the same shared memory. The modem's
+ * driver says where at boot ("VSS PARAM: 0x09000000: 0x00200000"), and
+ * Samsung's abox.c maps shm_get_vparam_base() at IOVA_VSS_PARAMETER: empty
+ * memory there was no parameters at all for the voice firmware. */
+#define CP_VPARAM_PA		0xf9000000UL
+#define CP_VPARAM_SIZE		0x200000
 #define LV2_TABLES		64
 
 /* messages, as in Samsung's abox_ipc.h */
@@ -287,10 +295,49 @@ static u32 dsm_rx[8];	/* the DSP's last DSM answer, first words */
 static int n_dsm_rx = 8;
 module_param_array(dsm_rx, uint, &n_dsm_rx, 0444);
 static bool vss_started;
+static bool call_mic_on;	/* the microphones are feeding the voice firmware */
+static bool dsm_before_call;	/* DSM was on: back on when the call ends */
 static int pointer_stalls, pointer_backsteps;
 module_param(pointer_stalls, int, 0444);
 module_param(pointer_backsteps, int, 0444);
 static DEFINE_MUTEX(amp_lock);
+
+/*
+ * Capture from the main microphones (audio/MIC-REA.md). Off unless the module
+ * is loaded with capture=1: then a third device, hw:0,2 "Microphone", appears,
+ * and nothing of it touches the hardware until it is opened. The path is the
+ * stock "route-main-mic" one: the two digital microphones on IN3L/IN3R of the
+ * CS47L93 codec (SPI, bit-banged here) -> codec AIF1 TX -> ABOX UAIF0 (the
+ * SoC drives the bit clock) -> NSRC0 -> SIFM0 -> WDMA1 -> the ALSA buffer.
+ */
+static bool capture;
+module_param(capture, bool, 0444);
+MODULE_PARM_DESC(capture, "offer the main microphones as hw:0,2 (default off; see audio/MIC-REA.md)");
+/*
+ * The microphones' digital gain over 0 dB, in 0.5 dB steps (0..63), from the
+ * next capture on. At 0 dB, Samsung's "media-mic" level, speech came out far
+ * too quiet: their HAL adds gain after the codec, ours does not.
+ */
+static int mic_gain = 40;
+module_param(mic_gain, int, 0644);
+MODULE_PARM_DESC(mic_gain, "microphone gain over 0 dB in 0.5 dB steps, 0..63, from the next capture");
+static int cap_wdma = 1;	/* stock: route-nsrc0-to-wdma1, capture_link 9 */
+module_param(cap_wdma, int, 0444);
+MODULE_PARM_DESC(cap_wdma, "the DSP's capture DMA behind NSRC0/SIFM0 (0 or 1; stock 1)");
+#define WDMA0_BUF_FULL		8	/* the DSP's interrupt for WDMA0; WDMA1's is 9 */
+struct cap_stream {
+	void *buf;
+	dma_addr_t buf_pa;
+	struct snd_pcm_substream *active;	/* prepared, for period interrupts */
+	size_t last_pos;
+	int stalled;
+	bool opened, running, needs_reset, path_on, codec_up;
+};
+static struct cap_stream cap;
+static struct snd_pcm *capture_pcm;
+static unsigned int cap_irqs, cap_msgs;
+module_param(cap_irqs, uint, 0444);
+module_param(cap_msgs, uint, 0444);
 
 static void pmu_update(u32 reg, u32 mask, u32 val)
 {
@@ -753,6 +800,18 @@ static void rx_one(void)
 			snd_pcm_period_elapsed(s);
 		}
 		rcu_read_unlock();
+	} else if (id == IPC_PCMCAPTURE && type == PCM_PLTDAI_POINTER && capture &&
+		   msg[3] == (u32)cap_wdma) {
+		/* the microphone stream (abox_wdma_irq_handler); the call's and
+		 * DSM's capture DMAs (WDMA2, WDMA4) are left alone as before */
+		struct snd_pcm_substream *s;
+
+		cap_msgs++;
+		rcu_read_lock();
+		s = READ_ONCE(cap.active);
+		if (s)
+			snd_pcm_period_elapsed(s);
+		rcu_read_unlock();
 	}
 }
 
@@ -764,7 +823,7 @@ static void rx_one(void)
 static irqreturn_t abox_isr(int irq, void *unused)
 {
 	irqreturn_t ret = IRQ_NONE;
-	bool period[2] = { false, false };
+	bool period[2] = { false, false }, cap_period = false;
 	int i;
 
 	for (i = 0; i < 32; i++) {
@@ -777,6 +836,8 @@ static irqreturn_t abox_isr(int irq, void *unused)
 			writel(stat, gicc + 0x1000);
 		if (nr == RDMA0_BUF_EMPTY || nr == RDMA0_BUF_EMPTY + 1)
 			period[nr - RDMA0_BUF_EMPTY] = true;	/* 12 is RDMA1's */
+		if (capture && nr == WDMA0_BUF_FULL + cap_wdma)
+			cap_period = true;
 		if (debug > 0) {
 			debug--;
 			pr_info("snd-zrn-abox: DSP interrupt %u (%08x)\n", nr, stat);
@@ -791,6 +852,13 @@ static irqreturn_t abox_isr(int irq, void *unused)
 			WRITE_ONCE(streams[i].irq_progress, jiffies);
 			snd_pcm_period_elapsed(s);
 		}
+	}
+	if (cap_period) {
+		struct snd_pcm_substream *s = READ_ONCE(cap.active);
+
+		cap_irqs++;
+		if (s)
+			snd_pcm_period_elapsed(s);
 	}
 	rcu_read_unlock();
 	rx_one();
@@ -1187,6 +1255,21 @@ static int call_msg(u32 type, u32 param)
 	return ipc_send(m, 6);
 }
 
+static int call_mic(bool on);
+static int dsm_set(bool on);
+#define ABOX_ROUTE_CTRL1_NSRC1	4
+static void sfr_field(u32 reg, int shift, u32 mask, u32 val);
+
+/*
+ * The path of a call, as Samsung's incall_* mixer paths (stock mixer_paths.xml):
+ *   down: RDMA4 -> SIFS0 -> UAIF1 -> amplifier, with SIFS0 -> RSRC0 -> RECP as
+ *         the echo reference (route-sifs0-to-rsrc0, route-rsrc0-to-wdma0);
+ *   up:   microphones -> codec AIF1 -> UAIF0 -> NSRC1 -> SIFM1 -> WDMA2
+ *         (route-cp-tx), which only ever ran with a capture stream open, so a
+ *         call had no microphone at all before 2026-10-30.
+ * Speaker management is taken off for the call: its route ends at SIFS1, and
+ * the voice comes on SIFS0.
+ */
 static int call_set(int route)
 {
 	int ret = 0;
@@ -1195,13 +1278,39 @@ static int call_set(int route)
 		return 0;
 	if (route) {
 		if (!vss_started && cp_vss) {
+			/* The voice firmware marks this word once it has come up. A SoC
+			 * sleep reboots the DSP, so VSS must start afresh, and a stale
+			 * mark from the last call left RDMA4 idle: wdma2 ran, the
+			 * earpiece was silent (the first call after a sleep that followed
+			 * another call, 30 Oct). Samsung clears it only at probe; its
+			 * DSP does not reboot here. */
+			void __iomem *magic = ioremap(CP_VSS_PA + CP_VSS_MAGIC, 4);
+
+			if (magic) {
+				pr_info("snd-zrn-abox: VSS mark was %08x: cleared\n", readl(magic));
+				writel(0, magic);
+				iounmap(magic);
+			}
 			ret = call_msg(ABOX_START_VSS, 0);
 			vss_started = !ret;
 			msleep(50);
 		}
+		if (!call_route && dsm_on) {
+			dsm_before_call = true;
+			dsm_set(false);
+		}
 		call_msg(ABOX_SET_TYPE, route == 2 ? SOUND_TYPE_SPEAKER : SOUND_TYPE_VOICE);
 		ret = call_msg(ABOX_SET_MODE, MODE_IN_CALL);
 		if (!call_route) {
+			if (!any_active()) {
+				mixp_flush();
+				mixp_flushes++;
+			}
+			sfr_field(ABOX_ROUTE_CTRL2, 0, 0xf, 1);		/* RSRC0 <- SIFS0 */
+			sfr_field(ABOX_SPUM_CTRL1, 0, 0x1, 1);		/* RECP PIFS0 */
+			/* no microphone must not cost the caller's voice: logged, on */
+			if (call_mic(true))
+				pr_err("snd-zrn-abox: call: no microphone\n");
 			memset(voice_rx, 0, VOICE_BYTES);
 			memset(voice_tx, 0, VOICE_BYTES);
 			voice_stream(IPC_PCMPLAYBACK, VOICE_RDMA, IOVA_VOICE_RX, true);
@@ -1215,16 +1324,28 @@ static int call_set(int route)
 		voice_stream(IPC_PCMCAPTURE, VOICE_WDMA, IOVA_VOICE_TX, false);
 		voice_stream(IPC_PCMPLAYBACK, VOICE_RDMA, IOVA_VOICE_RX, false);
 		ret = call_msg(ABOX_SET_MODE, MODE_NORMAL);
+		call_mic(false);
+		sfr_field(ABOX_SPUM_CTRL1, 0, 0x1, 0);
+		sfr_field(ABOX_ROUTE_CTRL2, 0, 0xf, 0);
 		amp_set(false);
+		call_route = 0;
+		if (dsm_before_call) {
+			dsm_before_call = false;
+			dsm_set(true);
+		}
 		if (any_active())
 			amp_set(true);	/* playback was running: back to both speakers */
+		if (!any_active()) {
+			mixp_flush();
+			mixp_flushes++;
+		}
 	}
 	pr_info("snd-zrn-abox: call audio %s (%d)\n", route == 1 ? "earpiece" : route == 2 ? "speaker" : "off", ret);
 	call_route = route;
 	return ret;
 }
 
-static void sfr_field(u32 reg, int shift, u32 mask, u32 val)
+static __maybe_unused void sfr_field(u32 reg, int shift, u32 mask, u32 val)
 {
 	writel((readl(sfr + reg) & ~(mask << shift)) | (val << shift), sfr + reg);
 }
@@ -1687,6 +1808,809 @@ static const struct snd_pcm_ops abox_pcm_ops = {
 	.mmap = abox_pcm_mmap,
 };
 
+/* ---- capture: the main microphones (capture=1 only) ------------------------ */
+
+/*
+ * ABOX side. Registers from Samsung's abox.h / abox_if.c / cmucal-sfr.c
+ * (exynos9810), routes from the stock mixer_paths.xml "route-ap-record":
+ * ABOX NSRC0 = UAIF0, ABOX SIFM0 = WDMA, read by pcm device 9 (WDMA1).
+ */
+#define ABOX_QCHANNEL_DISABLE	0x0038	/* bit 2: UAIF0's bit clock never gated */
+#define ABOX_UAIF0_CTRL0	0x0500
+#define ABOX_UAIF0_CTRL1	0x0504
+#define ABOX_WDMA0		0x2000
+#define WDMA_STATUS		0x30
+#define CMU_MUX_UAIF0		0x1004
+#define CMU_DIV_UAIF0		0x1824
+#define GPB0_CON		0x0000	/* gpb0-1..4: aud-i2s0-bus, function 2 */
+#define IOVA_WDMA(x)		(0x92000000UL + SZ_1M * (x))	/* Samsung's IOVA_WDMA_BUFFER */
+#define SET_INMUX0_SAMPLE_RATE	5
+#define SET_INMUX0_FORMAT	0x14
+#define SET_INMUX1_SAMPLE_RATE	6
+#define SET_INMUX1_FORMAT	0x15
+
+/*
+ * Codec side: Cirrus Logic CS47L93 (madera family, silicon ID 0x6371, as
+ * CS47L92) on the stock spi@10470000, chip select 0. That SPI block is not in
+ * the mainline device tree, so its pins are driven by hand: SPI mode 0,
+ * 32-bit address (bit 31 set to read), 16 bits of padding, 16-bit value, big
+ * endian (mainline cs47l92_16bit_spi_regmap). Pin roles: Exynos USI order,
+ * CLK, MOSI, MISO, CS on gpp0-4..7 (stock spi2-bus, spi2-cs-func).
+ */
+#define CODEC_ID		0x6371
+#define CODEC_SOFTWARE_RESET	0x0000
+#define CODEC_HW_REVISION	0x0001
+#define CODEC_SYSTEM_CLOCK_1	0x0101
+#define CODEC_SAMPLE_RATE_1	0x0102
+#define CODEC_FLL1		0x0170	/* fll->base: FLL1 Control 1 is +1 */
+#define CODEC_MIC_CP_1		0x0200
+#define CODEC_LDO2_CONTROL_1	0x0213
+#define CODEC_MIC_BIAS_CTRL_1	0x0218
+#define CODEC_MIC_BIAS_CTRL_5	0x021c
+#define CODEC_INPUT_ENABLES	0x0300
+#define CODEC_IN3L_CONTROL	0x0320
+#define CODEC_ADC_VOL_3L	0x0321
+#define CODEC_DMIC3L_CONTROL	0x0322
+#define CODEC_IN3R_CONTROL	0x0324
+#define CODEC_ADC_VOL_3R	0x0325
+#define CODEC_AIF1_BCLK_CTRL	0x0500
+#define CODEC_AIF1_RATE_CTRL	0x0503
+#define CODEC_AIF1_FORMAT	0x0504
+#define CODEC_AIF1_RX_BCLK_RATE	0x0506
+#define CODEC_AIF1_FRAME_CTRL_1	0x0507
+#define CODEC_AIF1_FRAME_CTRL_2	0x0508
+#define CODEC_AIF1_TX_ENABLES	0x0519
+#define CODEC_AIF1TX1MIX_SRC1	0x0700
+#define CODEC_AIF1TX2MIX_SRC1	0x0708
+#define CODEC_GPIO5_CTRL_1	0x1708	/* GPIO5..8 = AIF1 (pinctrl-cs47l92: pins 4..7) */
+#define CODEC_IRQ1_STATUS_1	0x1800
+#define CODEC_IRQ1_RAW_STATUS_1	0x1880
+#define  CODEC_BOOT_DONE	0x0080
+#define CODEC_IRQ1_RAW_STATUS_2	0x1881
+#define  CODEC_FLL1_LOCK	0x0100
+#define CODEC_SRC_IN3L		0x14	/* madera_mixer_values */
+#define CODEC_SRC_IN3R		0x15
+#define CODEC_IN_VU		0x0200
+#define CODEC_IN_MUTE		0x0100
+/* S2MPS18 LDO control registers (sensors/driver/zrn_bbd_board.c ldo_reg):
+ * LDO33 vdd_pmic_codec_1p8 (always on in the stock DT), LDO34 vdd_codec_1p2
+ * (DCVDD; not always on) */
+#define PMIC_L33CTRL		0x6a
+#define PMIC_L34CTRL		0x6b
+#define PMIC_LDO_ON		0xc0
+
+/* cs47l92_reva_16_patch, as mainline madera-core applies it after boot */
+static const u16 codec_patch[][2] = {
+	{ 0x3A2, 0x2C29 }, { 0x3A3, 0x0E00 }, { 0x281, 0x0000 }, { 0x282, 0x0000 },
+	{ 0x4EA, 0x0100 }, { 0x22B, 0x0000 }, { 0x4A0, 0x0080 }, { 0x4A1, 0x0000 },
+	{ 0x4A2, 0x0000 }, { 0x180B, 0x033F }, { 0x190B, 0x033F }, { 0x442, 0x0304 },
+	{ 0x34C, 0x0003 }, { 0x124, 0x0C49 }, { 0x120, 0x0345 }, { 0x120, 0x0305 },
+	{ 0x4FA, 0x5064 }, { 0x1300, 0x050E }, { 0x1302, 0x0101 }, { 0x1380, 0x02E0 },
+	{ 0x1381, 0xF942 }, { 0x1382, 0x04CE }, { 0x1383, 0xFF06 }, { 0x1390, 0x0304 },
+	{ 0x1391, 0xF8FF }, { 0x1392, 0x04F3 }, { 0x1393, 0xFF00 }, { 0x13A0, 0x02E0 },
+	{ 0x13A1, 0xF942 }, { 0x13A2, 0x04CE }, { 0x13A3, 0xFF06 }, { 0x13B0, 0x0304 },
+	{ 0x13B1, 0xF8FF }, { 0x13B2, 0x04F3 }, { 0x13B3, 0xFF00 }, { 0x412, 0x0005 },
+	{ 0x41A, 0x0005 }, { 0x422, 0x0005 },
+};
+
+static struct gpiod_lookup_table codec_gpios = {
+	.dev_id = "snd-zrn-abox",
+	.table = {
+		GPIO_LOOKUP_IDX("gpp0", 4, "codec-spi", 0, GPIO_ACTIVE_HIGH),	/* CLK */
+		GPIO_LOOKUP_IDX("gpp0", 5, "codec-spi", 1, GPIO_ACTIVE_HIGH),	/* MOSI */
+		GPIO_LOOKUP_IDX("gpp0", 6, "codec-spi", 2, GPIO_ACTIVE_HIGH),	/* MISO */
+		GPIO_LOOKUP_IDX("gpp0", 7, "codec-spi", 3, GPIO_ACTIVE_HIGH),	/* CS, low active */
+		GPIO_LOOKUP_IDX("gpg1", 0, "codec-reset", 0, GPIO_ACTIVE_HIGH),	/* low = reset */
+		{ }
+	},
+};
+static bool codec_gpios_added;
+static struct gpio_desc *spi_clk, *spi_mosi, *spi_miso, *spi_cs, *codec_rst;
+static DEFINE_MUTEX(codec_lock);
+static unsigned int codec_errors;
+module_param(codec_errors, uint, 0444);
+
+int s9p_acpm_pmic_read(u8 reg, u8 *val);
+int s9p_acpm_pmic_update(u8 reg, u8 val, u8 mask);
+
+/* codec_lock held. Mode 0, MSB first, about 250 kHz. */
+static void codec_xfer(const u8 *tx, u8 *rx, int n)
+{
+	int i, b;
+
+	gpiod_set_raw_value(spi_cs, 0);
+	udelay(1);
+	for (i = 0; i < n; i++) {
+		u8 in = 0;
+
+		for (b = 7; b >= 0; b--) {
+			gpiod_set_raw_value(spi_mosi, (tx[i] >> b) & 1);
+			udelay(2);
+			gpiod_set_raw_value(spi_clk, 1);
+			udelay(1);
+			in = (in << 1) | (gpiod_get_raw_value(spi_miso) & 1);
+			udelay(1);
+			gpiod_set_raw_value(spi_clk, 0);
+		}
+		rx[i] = in;
+	}
+	udelay(1);
+	gpiod_set_raw_value(spi_cs, 1);
+	udelay(2);
+}
+
+static void codec_write(u32 reg, u16 val)
+{
+	u8 tx[8] = { reg >> 24, reg >> 16, reg >> 8, reg, 0, 0, val >> 8, val }, rx[8];
+
+	codec_xfer(tx, rx, 8);
+}
+
+static u16 codec_read(u32 reg)
+{
+	u8 tx[8] = { (reg >> 24) | 0x80, reg >> 16, reg >> 8, reg, 0, 0, 0, 0 }, rx[8];
+
+	codec_xfer(tx, rx, 8);
+	return (rx[6] << 8) | rx[7];
+}
+
+static void codec_update(u32 reg, u16 mask, u16 val)
+{
+	codec_write(reg, (codec_read(reg) & ~mask) | (val & mask));
+}
+
+/* LDO34 (the codec's 1.2 V DCVDD) on, through s9p-acpm if it is loaded; no
+ * link dependency on it, so playback never needs that module. */
+static void codec_supplies(void)
+{
+	int (*rd)(u8, u8 *) = symbol_get(s9p_acpm_pmic_read);
+	int (*upd)(u8, u8, u8) = symbol_get(s9p_acpm_pmic_update);
+	u8 l33 = 0, l34 = 0;
+
+	if (!rd || !upd) {
+		pr_warn("snd-zrn-abox: s9p-acpm not loaded: codec supplies (LDO33/34) as the bootloader left them\n");
+		goto out;
+	}
+	rd(PMIC_L33CTRL, &l33);
+	rd(PMIC_L34CTRL, &l34);
+	pr_info("snd-zrn-abox: codec supplies: LDO33 %02x, LDO34 %02x\n", l33, l34);
+	if ((l34 & PMIC_LDO_ON) != PMIC_LDO_ON) {
+		upd(PMIC_L34CTRL, PMIC_LDO_ON, PMIC_LDO_ON);
+		msleep(10);	/* stock regulator-enable-ramp-delay 5 ms */
+		rd(PMIC_L34CTRL, &l34);
+		pr_info("snd-zrn-abox: LDO34 switched on (%02x)\n", l34);
+	}
+out:
+	if (rd)
+		symbol_put(s9p_acpm_pmic_read);
+	if (upd)
+		symbol_put(s9p_acpm_pmic_update);
+}
+
+static int codec_get_gpios(void)
+{
+	struct device *dev = &pdev->dev;
+	struct gpio_desc **d[4] = { &spi_clk, &spi_mosi, &spi_miso, &spi_cs };
+	int i;
+
+	if (codec_rst)
+		return 0;
+	if (!codec_gpios_added) {
+		gpiod_add_lookup_table(&codec_gpios);
+		codec_gpios_added = true;
+	}
+	for (i = 0; i < 4; i++) {
+		*d[i] = gpiod_get_index(dev, "codec-spi", i,
+			i == 2 ? GPIOD_IN : i == 3 ? GPIOD_OUT_HIGH : GPIOD_OUT_LOW);
+		if (IS_ERR(*d[i])) {
+			int ret = PTR_ERR(*d[i]);
+
+			*d[i] = NULL;
+			pr_err("snd-zrn-abox: codec SPI pin %d: %d\n", i, ret);
+			return ret;
+		}
+	}
+	codec_rst = gpiod_get(dev, "codec-reset", GPIOD_OUT_LOW);	/* in reset */
+	if (IS_ERR(codec_rst)) {
+		int ret = PTR_ERR(codec_rst);
+
+		codec_rst = NULL;
+		pr_err("snd-zrn-abox: codec reset pin: %d\n", ret);
+		return ret;
+	}
+	return 0;
+}
+
+static void codec_put_gpios(void)
+{
+	struct gpio_desc **d[5] = { &spi_clk, &spi_mosi, &spi_miso, &spi_cs, &codec_rst };
+	int i;
+
+	for (i = 0; i < 5; i++) {
+		if (*d[i])
+			gpiod_put(*d[i]);
+		*d[i] = NULL;
+	}
+	if (codec_gpios_added)
+		gpiod_remove_lookup_table(&codec_gpios);
+	codec_gpios_added = false;
+}
+
+/* Power, reset, boot, identify, patch: once. As mainline madera_dev_init. */
+static int codec_power_up(void)
+{
+	u16 id, rev, raw = 0;
+	int i, ret;
+
+	if (cap.codec_up) {
+		/* The codec's core rail goes down over a SoC sleep, and it comes back
+		 * at its reset defaults while this flag stays set. codec_start()
+		 * writes nearly everything again, FLL1 still locks and SPI still
+		 * reads the ID, but AIF1's pins stay GPIOs (GP6 0xa001): nothing on
+		 * the data line, digital silence from every recording and every call
+		 * after the first sleep (seen 2026-10-30). The pins tell. */
+		u16 fn;
+
+		mutex_lock(&codec_lock);
+		fn = codec_read(CODEC_GPIO5_CTRL_1) & 0x03ff;
+		mutex_unlock(&codec_lock);
+		if (!fn)
+			return 0;
+		pr_info("snd-zrn-abox: the codec was reset (GP5 fn %03x): setting it up again\n", fn);
+		cap.codec_up = false;
+		cap.path_on = false;
+	}
+	ret = codec_get_gpios();
+	if (ret)
+		return ret;
+	codec_supplies();
+	mutex_lock(&codec_lock);
+	gpiod_set_raw_value(codec_rst, 0);
+	usleep_range(2000, 3000);
+	gpiod_set_raw_value(codec_rst, 1);
+	usleep_range(2000, 3000);
+	for (i = 0; i < 50; i++) {
+		raw = codec_read(CODEC_IRQ1_RAW_STATUS_1);
+		if (raw != 0xffff && (raw & CODEC_BOOT_DONE))
+			break;
+		usleep_range(1000, 2000);
+	}
+	id = codec_read(CODEC_SOFTWARE_RESET);
+	rev = codec_read(CODEC_HW_REVISION);
+	pr_info("snd-zrn-abox: codec id %04x rev %04x, boot status %04x\n", id, rev, raw);
+	if (id != CODEC_ID) {
+		/* nothing more written: back into reset */
+		gpiod_set_raw_value(codec_rst, 0);
+		mutex_unlock(&codec_lock);
+		codec_errors++;
+		pr_err("snd-zrn-abox: no CS47L93 on the codec bus (id %04x): no capture\n", id);
+		return -ENODEV;
+	}
+	codec_write(CODEC_IRQ1_STATUS_1, CODEC_BOOT_DONE);	/* ack, as madera_wait_for_boot */
+	for (i = 0; i < ARRAY_SIZE(codec_patch); i++)
+		codec_write(codec_patch[i][0], codec_patch[i][1]);
+	/* AIF1's four pins to their audio function (GPn_FN 0, default 1 = GPIO) */
+	for (i = 0; i < 4; i++)
+		codec_update(CODEC_GPIO5_CTRL_1 + 2 * i, 0x03ff, 0x0000);
+	mutex_unlock(&codec_lock);
+	cap.codec_up = true;
+	return 0;
+}
+
+/*
+ * The codec's clocks from the SoC's bit clock: FLL1 referenced to AIF1BCLK
+ * (1.536 MHz = 48 kHz x 16 bit x 2), out 49.152 MHz, SYSCLK 98.304 MHz. That
+ * keeps the codec locked to ABOX, so no rate converter is needed in the codec.
+ * (Stock does the same with FLL2 for ASYNCCLK, star_madera.c
+ * star_uaif0_madera_hw_params/prepare, and runs SYSCLK from a 26 MHz MCLK1
+ * that is not known to be running here.) Values from mainline
+ * madera_fllhj_apply() for fin 1536000, fout 49152000: refdiv 0, fref above
+ * MID_THRESH: gains 0x21f0, lockdet_thr 8, fbdiv 1, integer: N 32, theta 0,
+ * lambda 1, hp 0. Sequence as madera_fllhj_enable(). codec_lock held.
+ */
+static int codec_fll_on(void)
+{
+	int i;
+
+	codec_update(CODEC_FLL1 + 0x1, 0x0004, 0x0004);	/* HOLD */
+	codec_write(CODEC_FLL1 + 0x2, 32);			/* N, CTRL_UPD clear */
+	codec_update(CODEC_FLL1 + 0x3, 0xffff, 0);		/* THETA */
+	codec_update(CODEC_FLL1 + 0x4, 0xffff, 1);		/* LAMBDA */
+	codec_update(CODEC_FLL1 + 0x5, 0x03ff, 1);		/* FB_DIV */
+	codec_update(CODEC_FLL1 + 0x6, 0x00c0, 0);		/* REFCLK_DIV */
+	codec_update(CODEC_FLL1 + 0x8, 0xffff, 0x21f0);	/* gains */
+	codec_update(CODEC_FLL1 + 0xa, 0xd000, 0x1000);	/* HP 0, PHASEDET_ENA */
+	codec_update(CODEC_FLL1 + 0xb, 0x001e, 8 << 1);	/* LOCKDET_THR */
+	codec_update(CODEC_FLL1 + 0xd, 0x0103, 0);		/* no EFS sync, no fast VCO */
+	codec_update(CODEC_FLL1 + 0x1, 0xf000, 8 << 12);	/* REFCLK_SRC AIF1BCLK */
+	codec_update(CODEC_FLL1 + 0x1, 0x0001, 0x0001);	/* ENA */
+	codec_update(CODEC_FLL1 + 0xb, 0x0001, 0x0001);	/* LOCKDET */
+	codec_update(CODEC_FLL1 + 0x2, 0x8000, 0x8000);	/* CTRL_UPD */
+	codec_update(CODEC_FLL1 + 0x1, 0x0004, 0);		/* HOLD off: lock */
+	for (i = 0; i < 30; i++) {
+		if (codec_read(CODEC_IRQ1_RAW_STATUS_2) & CODEC_FLL1_LOCK)
+			return 0;
+		usleep_range(1000, 2000);
+	}
+	return -ETIMEDOUT;
+}
+
+static void codec_fll_off(void)
+{
+	codec_update(CODEC_FLL1 + 0xb, 0x0001, 0);		/* LOCKDET */
+	codec_update(CODEC_FLL1 + 0x1, 0x0004, 0x0004);	/* HOLD */
+	codec_update(CODEC_FLL1 + 0x1, 0x0001, 0);		/* ENA */
+	usleep_range(1000, 2000);
+	codec_update(CODEC_FLL1 + 0x2, 0x8000, 0);		/* CTRL_UPD */
+}
+
+/* the route-main-mic path on: IN3L/IN3R (DMIC1, DMIC3) -> AIF1TX1/2 */
+static int codec_start(void)
+{
+	int ret;
+
+	mutex_lock(&codec_lock);
+	ret = codec_fll_on();
+	if (ret) {
+		pr_err("snd-zrn-abox: codec FLL1 did not lock on the bit clock (%04x)\n",
+			codec_read(CODEC_IRQ1_RAW_STATUS_2));
+		codec_fll_off();
+		codec_errors++;
+		goto out;
+	}
+	codec_write(CODEC_SAMPLE_RATE_1, 0x0003);		/* 48 kHz */
+	codec_write(CODEC_SYSTEM_CLOCK_1, 0x0444);		/* 98.304 MHz, on, from FLL1 */
+	/* MICVDD 3.0 V from the charge pump (stock DT micvdd), not bypassed */
+	codec_update(CODEC_LDO2_CONTROL_1, 0x07e0, 0x24 << 5);
+	codec_update(CODEC_MIC_CP_1, 0x0003, 0x0001);
+	usleep_range(3000, 4000);
+	/* MICBIAS1 1.8 V, external capacitor (stock DT MICBIAS1); 1A for DMIC1
+	 * (IN3L), 1C for DMIC3 (IN3R) (stock samsung,routing) */
+	codec_update(CODEC_MIC_BIAS_CTRL_1, 0x81e1, 0x8000 | (3 << 5) | 0x0001);
+	codec_update(CODEC_MIC_BIAS_CTRL_5, 0x0101, 0x0101);
+	/* IN3: digital, clocked at 3.072 MHz (stock "IN3 OSR"), supplied from
+	 * MICBIAS1 (stock cirrus,dmic-ref), high-pass on (stock "IN3L HPF") */
+	codec_update(CODEC_IN3L_CONTROL, 0x9800, 0x8800);
+	codec_update(CODEC_IN3R_CONTROL, 0x8000, 0x8000);
+	codec_update(CODEC_DMIC3L_CONTROL, 0x0700, 5 << 8);
+	/* AIF1: slave, I2S, 16-bit words in 16-bit slots, 32 bit clocks a frame,
+	 * at SYSCLK rate 1; TX1 IN3L, TX2 IN3R */
+	codec_update(CODEC_AIF1_BCLK_CTRL, 0x0020, 0);
+	codec_update(CODEC_AIF1_RATE_CTRL, 0xf800, 0);
+	codec_update(CODEC_AIF1_FORMAT, 0x0007, 2);
+	codec_write(CODEC_AIF1_RX_BCLK_RATE, 32);
+	codec_write(CODEC_AIF1_FRAME_CTRL_1, (16 << 8) | 16);
+	codec_write(CODEC_AIF1_FRAME_CTRL_2, (16 << 8) | 16);
+	codec_write(CODEC_AIF1TX1MIX_SRC1, CODEC_SRC_IN3L);
+	codec_write(CODEC_AIF1TX2MIX_SRC1, CODEC_SRC_IN3R);
+	codec_update(CODEC_AIF1_TX_ENABLES, 0x0003, 0x0003);
+	codec_update(CODEC_INPUT_ENABLES, 0x0030, 0x0030);
+	usleep_range(1000, 3000);
+	/* unmuted at mic_gain over 0 dB (0x80), then the volume update (madera_in_ev) */
+	codec_update(CODEC_ADC_VOL_3L, 0x01ff, 0x0080 + clamp(mic_gain, 0, 63));
+	codec_update(CODEC_ADC_VOL_3R, 0x01ff, 0x0080 + clamp(mic_gain, 0, 63));
+	codec_update(CODEC_ADC_VOL_3L, CODEC_IN_VU, CODEC_IN_VU);
+	codec_update(CODEC_ADC_VOL_3R, CODEC_IN_VU, CODEC_IN_VU);
+	pr_info("snd-zrn-abox: codec capture on (inputs %04x, AIF1 TX %04x, sysclk %04x)\n",
+		codec_read(CODEC_INPUT_ENABLES), codec_read(CODEC_AIF1_TX_ENABLES),
+		codec_read(CODEC_SYSTEM_CLOCK_1));
+out:
+	mutex_unlock(&codec_lock);
+	return ret;
+}
+
+static void codec_stop(void)
+{
+	mutex_lock(&codec_lock);
+	codec_update(CODEC_ADC_VOL_3L, CODEC_IN_MUTE | CODEC_IN_VU, CODEC_IN_MUTE | CODEC_IN_VU);
+	codec_update(CODEC_ADC_VOL_3R, CODEC_IN_MUTE | CODEC_IN_VU, CODEC_IN_MUTE | CODEC_IN_VU);
+	codec_update(CODEC_INPUT_ENABLES, 0x0030, 0);
+	codec_update(CODEC_AIF1_TX_ENABLES, 0x0003, 0);
+	codec_write(CODEC_AIF1TX1MIX_SRC1, 0);
+	codec_write(CODEC_AIF1TX2MIX_SRC1, 0);
+	codec_update(CODEC_MIC_BIAS_CTRL_5, 0x0101, 0);
+	codec_update(CODEC_MIC_BIAS_CTRL_1, 0x0001, 0);
+	codec_update(CODEC_MIC_CP_1, 0x0003, 0x0002);		/* off, bypass: reset default */
+	codec_update(CODEC_SYSTEM_CLOCK_1, 0x0040, 0);
+	codec_fll_off();
+	mutex_unlock(&codec_lock);
+}
+
+/* stream_lock held. UAIF0 as master at 48 kHz/16/2, NSRC0 <- UAIF0, SIFM0 ->
+ * WDMA, its bit clock running, then the codec. */
+static int cap_path_on(void)
+{
+	int ret;
+
+	if (cap.path_on)
+		return 0;
+	/* PLL / 16 (DIV_AUDIF, as set at boot) / 48 = 1.536 MHz, as UAIF1 */
+	cmu_div(CMU_DIV_UAIF0, 47);
+	writel(readl(cmu + CMU_MUX_UAIF0) & ~1U, cmu + CMU_MUX_UAIF0);
+	writel((readl(pins + GPB0_CON) & ~0xffff0U) | 0x22220, pins + GPB0_CON);
+	/* as UAIF1 (dsp_boot): I2S, 16 bits in 16-bit slots, two; abox_uaif_set_fmt
+	 * CBS_CFS = MODE 1 (the SoC drives the clocks) */
+	writel((9 << 24) | BIT(23) | (1 << 18) | (15 << 12), sfr + ABOX_UAIF0_CTRL1);
+	writel(readl(sfr + ABOX_UAIF0_CTRL0) | BIT(2), sfr + ABOX_UAIF0_CTRL0);
+	sfr_field(ABOX_ROUTE_CTRL1, 0, 0xf, 8);		/* NSRC0 <- UAIF0 */
+	sfr_field(ABOX_SPUM_CTRL0, 7, 0x1, 0);		/* SIFM0 -> WDMA */
+	sfr_field(ABOX_SPUM_CTRL0, 4, 0x1, 1);		/* NSRC0 rate converter on (stock SPUM ASRC1) */
+	/* abox_uaif_set_tristate(0): the bit clock out before the codec locks to it */
+	writel(readl(sfr + ABOX_QCHANNEL_DISABLE) | BIT(2), sfr + ABOX_QCHANNEL_DISABLE);
+	usleep_range(1000, 2000);
+	ret = codec_start();
+	if (ret) {
+		writel(readl(sfr + ABOX_QCHANNEL_DISABLE) & ~BIT(2), sfr + ABOX_QCHANNEL_DISABLE);
+		sfr_field(ABOX_ROUTE_CTRL1, 0, 0xf, 0);
+		return ret;
+	}
+	cap.path_on = true;
+	return 0;
+}
+
+static void cap_path_off(void)
+{
+	if (!cap.path_on || call_mic_on)	/* a call still needs it */
+		return;
+	if (cap.codec_up)
+		codec_stop();
+	writel(readl(sfr + ABOX_UAIF0_CTRL0) & ~BIT(1), sfr + ABOX_UAIF0_CTRL0);
+	writel(readl(sfr + ABOX_QCHANNEL_DISABLE) & ~BIT(2), sfr + ABOX_QCHANNEL_DISABLE);
+	sfr_field(ABOX_ROUTE_CTRL1, 0, 0xf, 0);		/* NSRC0 RESERVED, stock default */
+	cap.path_on = false;
+}
+
+/*
+ * The microphones for a call, whether or not anybody is recording: Samsung's
+ * route-cp-tx, NSRC1 <- UAIF0, SIFM1 -> WDMA. The codec and UAIF0 are shared
+ * with the capture stream (which uses NSRC0); whichever stops last turns them
+ * off.
+ */
+static int call_mic(bool on)
+{
+	u32 m[6] = { IPC_ABOX_CONFIG, 0, SET_INMUX1_SAMPLE_RATE, RATE, 0, 0 };
+	int ret = 0;
+
+	if (!capture)
+		return on ? -ENODEV : 0;
+	mutex_lock(&stream_lock);
+	if (on && !call_mic_on) {
+		ret = codec_power_up();
+		if (!ret)
+			ret = ipc_send(m, 6);
+		if (!ret) {
+			m[2] = SET_INMUX1_FORMAT; m[3] = 16; m[4] = 2;
+			ret = ipc_send(m, 6);
+		}
+		if (!ret)
+			ret = cap_path_on();
+		if (!ret) {
+			sfr_field(ABOX_ROUTE_CTRL1, ABOX_ROUTE_CTRL1_NSRC1, 0xf, 8);
+			sfr_field(ABOX_SPUM_CTRL0, 11, 0x1, 0);	/* SIFM1 -> WDMA */
+			sfr_field(ABOX_SPUM_CTRL0, 8, 0x1, 1);	/* NSRC1 rate converter on */
+			writel(readl(sfr + ABOX_UAIF0_CTRL0) | BIT(1), sfr + ABOX_UAIF0_CTRL0);
+			call_mic_on = true;
+		}
+	} else if (!on && call_mic_on) {
+		sfr_field(ABOX_ROUTE_CTRL1, ABOX_ROUTE_CTRL1_NSRC1, 0xf, 0);
+		call_mic_on = false;
+		if (!READ_ONCE(cap.running))
+			writel(readl(sfr + ABOX_UAIF0_CTRL0) & ~BIT(1), sfr + ABOX_UAIF0_CTRL0);
+		if (!cap.opened)
+			cap_path_off();
+	}
+	mutex_unlock(&stream_lock);
+	return ret;
+}
+
+/* The loudest sample in a DMA's buffer, when that is in the voice firmware's
+ * memory (mapped for a moment: this is read every few seconds). -1 elsewhere. */
+static int vss_buf_peak(u32 start, u32 end)
+{
+	void __iomem *map;
+	int i, n, peak = 0;
+
+	if (start < IOVA_VSS || start >= IOVA_VSS + CP_VSS_SIZE || end <= start)
+		return -1;
+	n = min_t(u32, end - start, SZ_8K) & ~1;
+	if (!n || start + n > IOVA_VSS + CP_VSS_SIZE)
+		return -1;
+	map = ioremap(CP_VSS_PA + ((start - IOVA_VSS) & ~1U), n);
+	if (!map)
+		return -1;
+	for (i = 0; i < n; i += 2)
+		peak = max(peak, abs((int)(s16)readw(map + i)));
+	iounmap(map);
+	return peak;
+}
+
+/* How the path of a call stands, for the bench and for the first seconds of a
+ * real call in the journal: the loudest sample lately in each direction (no
+ * sound itself), the two DMAs' status, the routes. */
+static int call_diag_get(char *buf, const struct kernel_param *kp)
+{
+	s16 *rx = voice_rx, *tx = voice_tx;
+	int i, rx_peak = 0, tx_peak = 0;
+	u16 gp5 = 0, gp6 = 0, inputs = 0;
+	int tx_vss = -1, rx_vss = -1;
+
+	if (!booted || suspending)
+		return sysfs_emit(buf, "off\n");
+	for (i = 0; i < VOICE_BYTES / 2; i++) {
+		rx_peak = max(rx_peak, abs((int)rx[i]));
+		tx_peak = max(tx_peak, abs((int)tx[i]));
+	}
+	if (cap.codec_up && codec_rst) {
+		mutex_lock(&codec_lock);
+		gp5 = codec_read(CODEC_GPIO5_CTRL_1);
+		gp6 = codec_read(CODEC_GPIO5_CTRL_1 + 2);
+		inputs = codec_read(CODEC_INPUT_ENABLES);
+		mutex_unlock(&codec_lock);
+	}
+	/* tx_buf: where WDMA2 really writes, 0x922... being voice_tx above; the
+	 * peaks stayed 0 through a call whose voice was heard, so the voice
+	 * firmware has its own buffers. tx_vss, rx_vss: the peaks in those */
+	if (call_route) {
+		u32 w = ABOX_WDMA0 + 0x100 * VOICE_WDMA, r = ABOX_RDMA0 + 0x100 * VOICE_RDMA;
+
+		tx_vss = vss_buf_peak(readl(sfr + w + 0x08), readl(sfr + w + 0x0c));
+		rx_vss = vss_buf_peak(readl(sfr + r + 0x08), readl(sfr + r + 0x0c));
+	}
+	return sysfs_emit(buf, "route=%d mic=%d vss=%d rx_peak=%d tx_peak=%d rdma4=%08x wdma2=%08x route1=%08x spum0=%08x uaif0=%08x uaif1=%08x tx_buf=%08x tx_off=%08x tx_vss=%d rx_vss=%d gp5=%04x gp6=%04x inputs=%04x\n",
+		call_route, call_mic_on, vss_started, rx_peak, tx_peak,
+		readl(sfr + ABOX_RDMA0 + 0x100 * VOICE_RDMA + RDMA_STATUS),
+		readl(sfr + ABOX_WDMA0 + 0x100 * VOICE_WDMA + WDMA_STATUS),
+		readl(sfr + ABOX_ROUTE_CTRL1), readl(sfr + ABOX_SPUM_CTRL0),
+		readl(sfr + ABOX_UAIF0_CTRL0), readl(sfr + ABOX_UAIF1_CTRL0),
+		readl(sfr + ABOX_WDMA0 + 0x100 * VOICE_WDMA + 0x08),
+		readl(sfr + ABOX_WDMA0 + 0x100 * VOICE_WDMA + 0x10),
+		tx_vss, rx_vss, gp5, gp6, inputs);
+}
+static const struct kernel_param_ops call_diag_ops = { .get = call_diag_get };
+module_param_cb(call_diag, &call_diag_ops, NULL, 0444);
+
+static int cap_msg(u32 type, u32 a, u32 b, u32 c)
+{
+	return dma_msg(IPC_PCMCAPTURE, cap_wdma, type, a, b, c);
+}
+
+/* what the DSP's input mux 0 runs at (abox_sample_rate_put_ipc,
+ * abox_sif_format_put_ipc for SIFM0: SET_INMUX0_*) */
+static int cap_config(void)
+{
+	u32 m[6] = { IPC_ABOX_CONFIG, 0, SET_INMUX0_SAMPLE_RATE, RATE, 0, 0 };
+	int ret = ipc_send(m, 6);
+
+	if (!ret) {
+		m[2] = SET_INMUX0_FORMAT; m[3] = 16; m[4] = 2;
+		ret = ipc_send(m, 6);
+	}
+	return ret;
+}
+
+static int cap_open(struct snd_pcm_substream *s)
+{
+	int ret;
+
+	mutex_lock(&stream_lock);
+	if (suspending || !booted) {
+		ret = -EIO;
+		goto out;
+	}
+	ret = codec_power_up();
+	if (ret)
+		goto out;
+	s->runtime->hw = abox_hw;
+	snd_pcm_hw_constraint_integer(s->runtime, SNDRV_PCM_HW_PARAM_PERIODS);
+	snd_pcm_hw_constraint_step(s->runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_BYTES, 16);
+	ret = cap_config();
+	if (!ret)
+		ret = cap_msg(PCM_PLTDAI_OPEN, 0, 0, 0);
+	if (!ret)
+		cap.opened = true;
+out:
+	mutex_unlock(&stream_lock);
+	return ret;
+}
+
+static int cap_close(struct snd_pcm_substream *s)
+{
+	mutex_lock(&stream_lock);
+	WRITE_ONCE(cap.active, NULL);
+	synchronize_rcu();
+	if (booted)
+		cap_msg(PCM_PLTDAI_CLOSE, 0, 0, 0);
+	cap_path_off();
+	cap.opened = false;
+	mutex_unlock(&stream_lock);
+	return 0;
+}
+
+static int cap_hw_params(struct snd_pcm_substream *s, struct snd_pcm_hw_params *p)
+{
+	struct snd_pcm_runtime *rt = s->runtime;
+	int ret;
+
+	mutex_lock(&stream_lock);
+	if (suspending || !booted) {
+		ret = -EIO;
+		goto out;
+	}
+	rt->dma_area = cap.buf;
+	rt->dma_addr = cap.buf_pa;
+	rt->dma_bytes = params_buffer_bytes(p);
+	ret = cap_msg(PCM_SET_BUFFER, IOVA_WDMA(cap_wdma), params_period_bytes(p), params_periods(p));
+	if (!ret)
+		ret = cap_msg(PCM_PLTDAI_HW_PARAMS, params_rate(p), 16, params_channels(p));
+out:
+	mutex_unlock(&stream_lock);
+	return ret;
+}
+
+static int cap_hw_free(struct snd_pcm_substream *s)
+{
+	mutex_lock(&stream_lock);
+	WRITE_ONCE(cap.active, NULL);
+	synchronize_rcu();
+	if (booted)
+		cap_msg(PCM_PLTDAI_HW_FREE, 0, 0, 0);
+	s->runtime->dma_area = NULL;
+	s->runtime->dma_addr = 0;
+	s->runtime->dma_bytes = 0;
+	mutex_unlock(&stream_lock);
+	return 0;
+}
+
+static int cap_prepare(struct snd_pcm_substream *s)
+{
+	struct snd_pcm_runtime *rt = s->runtime;
+	int ret;
+
+	mutex_lock(&stream_lock);
+	if (suspending || !booted) {
+		ret = -EIO;
+		goto out;
+	}
+	if (cap.needs_reset) {
+		/* a new firmware instance: its routes and config gone too */
+		cap_path_off();
+		ret = cap_config();
+		if (!ret)
+			ret = cap_msg(PCM_PLTDAI_CLOSE, 0, 0, 0);
+		if (!ret)
+			ret = cap_msg(PCM_PLTDAI_OPEN, 0, 0, 0);
+		if (!ret)
+			ret = cap_msg(PCM_SET_BUFFER, IOVA_WDMA(cap_wdma),
+				frames_to_bytes(rt, rt->period_size), rt->periods);
+		if (!ret)
+			ret = cap_msg(PCM_PLTDAI_HW_PARAMS, RATE, 16, 2);
+		if (ret)
+			goto out;
+	}
+	ret = cap_path_on();
+	if (ret)
+		goto out;
+	memset(cap.buf, 0, BUFFER_BYTES);
+	cap.last_pos = 0;
+	cap.stalled = 0;
+	ret = cap_msg(PCM_PLTDAI_PREPARE, 0, 0, 0);
+	if (!ret) {
+		cap.needs_reset = false;
+		WRITE_ONCE(cap.active, s);
+	}
+out:
+	mutex_unlock(&stream_lock);
+	return ret;
+}
+
+static int cap_trigger(struct snd_pcm_substream *s, int cmd)
+{
+	int ret;
+
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+	case SNDRV_PCM_TRIGGER_RESUME:
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		if (suspending || !booted || cap.needs_reset || !cap.path_on)
+			return -EPIPE;
+		WRITE_ONCE(cap.running, true);
+		/* abox_uaif_trigger: the port's input side on */
+		writel(readl(sfr + ABOX_UAIF0_CTRL0) | BIT(1), sfr + ABOX_UAIF0_CTRL0);
+		ret = cap_msg(PCM_PLTDAI_TRIGGER, 1, 0, 0);
+		if (ret)
+			WRITE_ONCE(cap.running, false);
+		return ret;
+	case SNDRV_PCM_TRIGGER_STOP:
+	case SNDRV_PCM_TRIGGER_SUSPEND:
+	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		WRITE_ONCE(cap.running, false);
+		ret = cap_msg(PCM_PLTDAI_TRIGGER, 0, 0, 0);
+		if (!call_mic_on)
+			writel(readl(sfr + ABOX_UAIF0_CTRL0) & ~BIT(1), sfr + ABOX_UAIF0_CTRL0);
+		return ret;
+	}
+	return -EINVAL;
+}
+
+/* Where the DSP has written to: as abox_pcm_pointer, from WDMA's status
+ * (abox_wdma_pointer: same fields as RDMA's), only ever forward. */
+static snd_pcm_uframes_t cap_pointer(struct snd_pcm_substream *s)
+{
+	size_t buffer = snd_pcm_lib_buffer_bytes(s);
+	size_t period = snd_pcm_lib_period_bytes(s);
+	unsigned long flags;
+	ssize_t offset, count, below;
+	size_t pos;
+	u32 status;
+
+	spin_lock_irqsave(&aud_lock, flags);
+	if (aud_off) {
+		spin_unlock_irqrestore(&aud_lock, flags);
+		return bytes_to_frames(s->runtime, cap.last_pos);
+	}
+	status = readl(sfr + ABOX_WDMA0 + 0x100 * cap_wdma + WDMA_STATUS);
+	spin_unlock_irqrestore(&aud_lock, flags);
+	if (!buffer)
+		return 0;
+	if (!(status & BIT(31))) {
+		if (++cap.stalled > 50)
+			return SNDRV_PCM_POS_XRUN;
+		return bytes_to_frames(s->runtime, cap.last_pos);
+	}
+	cap.stalled = 0;
+	offset = (ssize_t)((status >> 16) & 0x1fff) << 4;
+	count = status & 0x1fff;
+	below = buffer;
+	while (period && (offset % period) && below >= 0) {
+		below -= period;
+		if ((below & offset) == offset)
+			offset = below;
+	}
+	pos = (size_t)(offset + count) % buffer;
+	if (pos < cap.last_pos && cap.last_pos - pos < buffer / 2)
+		return bytes_to_frames(s->runtime, cap.last_pos);
+	cap.last_pos = pos;
+	return bytes_to_frames(s->runtime, pos);
+}
+
+static int cap_mmap(struct snd_pcm_substream *s, struct vm_area_struct *vma)
+{
+	return dma_mmap_coherent(&pdev->dev, vma, cap.buf, cap.buf_pa, BUFFER_BYTES);
+}
+
+static const struct snd_pcm_ops cap_ops = {
+	.open = cap_open,
+	.close = cap_close,
+	.hw_params = cap_hw_params,
+	.hw_free = cap_hw_free,
+	.prepare = cap_prepare,
+	.trigger = cap_trigger,
+	.pointer = cap_pointer,
+	.mmap = cap_mmap,
+};
+
+/* debugging: write a codec register number (hex), read back "reg value" */
+static u32 codec_peek_reg;
+static int codec_peek_set(const char *val, const struct kernel_param *kp)
+{
+	return kstrtou32(val, 16, &codec_peek_reg);
+}
+static int codec_peek_get(char *buf, const struct kernel_param *kp)
+{
+	u16 v;
+
+	mutex_lock(&codec_lock);
+	if (!cap.codec_up || !codec_rst) {
+		mutex_unlock(&codec_lock);
+		return sysfs_emit(buf, "codec not up\n");
+	}
+	v = codec_read(codec_peek_reg);
+	mutex_unlock(&codec_lock);
+	return sysfs_emit(buf, "%04x %04x\n", codec_peek_reg, v);
+}
+static const struct kernel_param_ops codec_peek_ops = { .set = codec_peek_set, .get = codec_peek_get };
+module_param_cb(codec_peek, &codec_peek_ops, NULL, 0644);
+
 static int vol_info(struct snd_kcontrol *k, struct snd_ctl_elem_info *info)
 {
 	info->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
@@ -1931,6 +2855,15 @@ static void teardown(void)
 	cancel_delayed_work_sync(&watchdog_work);
 	if (card)
 		snd_card_free(card);
+	if (capture) {
+		/* the codec back into reset; its supplies are left as found */
+		if (cap.path_on && started)
+			cap_path_off();
+		if (codec_rst)
+			gpiod_set_raw_value(codec_rst, 0);
+		cap.codec_up = false;
+		codec_put_gpios();
+	}
 	cancel_delayed_work_sync(&gear_work);
 	cancel_delayed_work_sync(&gear_again);
 	if (abox_irq > 0)
@@ -1971,6 +2904,9 @@ static void teardown(void)
 		dma_free_coherent(&pdev->dev, VOICE_BYTES, dsm_out, dsm_out_pa);
 	if (dsm_vi)
 		dma_free_coherent(&pdev->dev, VOICE_BYTES, dsm_vi, dsm_vi_pa);
+	if (cap.buf)
+		dma_free_coherent(&pdev->dev, BUFFER_BYTES, cap.buf, cap.buf_pa);
+	cap.buf = NULL;
 	if (lv1)
 		dma_free_coherent(&pdev->dev, SZ_16K, lv1, lv1_pa);
 	if (lv2)
@@ -2105,6 +3041,9 @@ static int abox_pm_event(struct notifier_block *nb, unsigned long event, void *u
 		/* Voice/DSM restoration needs its own protocol; never silently lose it. */
 		if (call_route || dsm_on)
 			return notifier_from_errno(-EBUSY);
+		/* the codec and UAIF0 path have no suspend/resume here yet */
+		if (READ_ONCE(cap.opened))
+			return notifier_from_errno(-EBUSY);
 		cancel_delayed_work_sync(&watchdog_work);
 		snd_power_change_state(card, SNDRV_CTL_POWER_D3hot);
 		for (i = 0; i < ARRAY_SIZE(playback); i++)
@@ -2190,6 +3129,11 @@ static void dsp_recover(void)
 		if (st->active)
 			snd_pcm_stop_xrun(st->active);
 	}
+	if (capture) {
+		cap.needs_reset = true;
+		if (cap.active)
+			snd_pcm_stop_xrun(cap.active);
+	}
 	amp_set(false);
 	if (abox_irq > 0) {
 		disable_irq(abox_irq);
@@ -2216,9 +3160,15 @@ static void dsp_recover(void)
 			st_msg(&streams[k], PCM_PLTDAI_TRIGGER, 0, 0, 0);
 			st_msg(&streams[k], PCM_PLTDAI_CLOSE, 0, 0, 0);
 		}
+		if (booted && capture && cap.opened) {
+			cap_msg(PCM_PLTDAI_TRIGGER, 0, 0, 0);
+			cap_msg(PCM_PLTDAI_CLOSE, 0, 0, 0);
+		}
 		for (k = 0; k < 100; k++) {
 			dma = (readl(sfr + ABOX_RDMA0 + RDMA_STATUS) |
 			       readl(sfr + ABOX_RDMA0 + 0x100 + RDMA_STATUS)) & BIT(31);
+			if (capture && cap.opened)
+				dma |= !!(readl(sfr + ABOX_WDMA0 + 0x100 * cap_wdma + WDMA_STATUS) & BIT(31));
 			if (!dma)
 				break;
 			usleep_range(500, 1000);
@@ -2330,6 +3280,15 @@ static int __init abox_init(void)
 	dsm_vi = dma_alloc_coherent(dev, VOICE_BYTES, &dsm_vi_pa, GFP_KERNEL);
 	lv1 = dma_alloc_coherent(dev, SZ_16K, &lv1_pa, GFP_KERNEL);
 	lv2 = dma_alloc_coherent(dev, LV2_TABLES * SZ_1K, &lv2_pa, GFP_KERNEL);
+	if (capture && (cap_wdma < 0 || cap_wdma > 1)) {
+		pr_warn("snd-zrn-abox: cap_wdma %d not 0 or 1: no capture\n", cap_wdma);
+		capture = false;
+	}
+	if (capture) {
+		cap.buf = dma_alloc_coherent(dev, BUFFER_BYTES, &cap.buf_pa, GFP_KERNEL);
+		if (!cap.buf)
+			goto err;
+	}
 	if (!dram || !iva || !vss || !vparam || !streams[0].buf || !streams[1].buf || !voice_rx || !voice_tx || !dsm_out || !dsm_vi || !lv1 || !lv2)
 		goto err;
 
@@ -2353,7 +3312,11 @@ static int __init abox_init(void)
 			ret = mmu_map(IOVA_VSS + CP_VSS_SIZE, vss_pa, VSS_SIZE - CP_VSS_SIZE);
 	} else if (!ret)
 		ret = mmu_map(IOVA_VSS, vss_pa, VSS_SIZE);
-	if (!ret)
+	if (!ret && cp_vss) {
+		ret = mmu_map(IOVA_VPARAM, CP_VPARAM_PA, CP_VPARAM_SIZE);
+		if (!ret)
+			ret = mmu_map(IOVA_VPARAM + CP_VPARAM_SIZE, vparam_pa, VPARAM_SIZE - CP_VPARAM_SIZE);
+	} else if (!ret)
 		ret = mmu_map(IOVA_VPARAM, vparam_pa, VPARAM_SIZE);
 	if (!ret)
 		ret = mmu_map(IOVA_RDMA0, streams[0].buf_pa, BUFFER_BYTES);
@@ -2367,6 +3330,8 @@ static int __init abox_init(void)
 		ret = mmu_map(IOVA_DSM_OUT, dsm_out_pa, VOICE_BYTES);
 	if (!ret)
 		ret = mmu_map(IOVA_DSM_VI, dsm_vi_pa, VOICE_BYTES);
+	if (!ret && capture)
+		ret = mmu_map(IOVA_WDMA(cap_wdma), cap.buf_pa, BUFFER_BYTES);
 	if (!ret)
 		ret = mmu_map(0x10000000, 0x10000000, SZ_4K);	/* the chip ID, as Samsung's driver does */
 	if (ret)
@@ -2428,6 +3393,13 @@ static int __init abox_init(void)
 			playback[1] = android;
 			strscpy(android->name, "Android", sizeof(android->name));
 			snd_pcm_set_ops(android, SNDRV_PCM_STREAM_PLAYBACK, &abox_pcm_ops);
+		}
+	}
+	if (!ret && capture) {
+		ret = snd_pcm_new(card, "Microphone", 2, 0, 1, &capture_pcm);
+		if (!ret) {
+			strscpy(capture_pcm->name, "Microphone", sizeof(capture_pcm->name));
+			snd_pcm_set_ops(capture_pcm, SNDRV_PCM_STREAM_CAPTURE, &cap_ops);
 		}
 	}
 	if (!ret)

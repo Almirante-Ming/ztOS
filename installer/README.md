@@ -1,6 +1,6 @@
 # Installing ztOS
 
-This guide installs **ztOS BETA-1**. The release version is recorded in the
+This guide installs **ztOS BETA-1.1**. The release version is recorded in the
 repository's `VERSION` file.
 
 ztOS is a phone operating system: the ztMETRO shell on Arch Linux ARM, with
@@ -39,6 +39,18 @@ The build never needs `sudo`. It runs in a user namespace, so your account
 needs a subordinate ID range in `/etc/subuid` and `/etc/subgid` (most
 distributions add one per user). ARM programs run through qemu-user, so a
 build takes 30–60 minutes.
+
+Instead of the `pacman` packages above, run the installer from the repository's
+Nix development shell. It supplies QEMU, the aarch64 UEFI firmware, and the
+image and build tools:
+
+```sh
+nix develop
+./installer/ztos install --target qemu
+```
+
+On x86-64 hosts you still need `qemu-user-static-binfmt` on Arch Linux, or
+`boot.binfmt.emulatedSystems = [ "aarch64-linux" ];` on NixOS.
 
 ## Trying it in the emulator
 
@@ -107,7 +119,7 @@ is; rebuild it from the current source to include later kernel fixes.
 |---|---|
 | Shell | ztMETRO, and only ztMETRO: no other desktop is installed |
 | First start | Welcome: Start and tiles, getting around (back, the app switcher, the action centre, the keyboard), your apps, making apps |
-| Apps | Settings, ZrnDevTest, Phone, Messaging, People, Music (eco; streaming and offline playback), WhatsApp (eco; linked-device text messaging), GNOME Terminal, Firefox, Chromium |
+| Apps | Settings, ZrnDevTest, Phone, Messaging, People, Music (eco; streaming and offline playback), GNOME Terminal. No desktop browser |
 | Updates | Command-line updater (`ztos-update check` / `apply`) and daily check; the Updates application is not preloaded yet |
 | Equalizers | Equalizer applications and EasyEffects are not preinstalled |
 | Developing | the ztOS SDK is installed (`ztos-sdk`), with its warm runtime started with the session; see `sdk/README.md` |

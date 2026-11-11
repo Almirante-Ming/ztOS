@@ -18,7 +18,7 @@ ifneq ($(FOREIGN),)
 $(info removed programs built for another machine, to build them here: $(FOREIGN))
 endif
 
-all: auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps settings/ztsettings devtest/zrndevtest devices/ztdevices perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd \
+all: auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps settings/ztsettings devtest/zrndevtest devices/ztdevices perfd/zrnperfd touchkeyd/ztos-touchkeyd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd \
 	csf/ztoscsf notifyd/ztnotifyd phone/ztphone messages/ztmessages contacts/ztcontacts files/ztfiles splash/ztos-splash \
 	store/ztstore power/ztpower camera/ztcamera sound/ztsound osial/ztosial
 
@@ -30,9 +30,21 @@ sounds/ztos-sounds: sounds/ztos-sounds.c
 IAL_FLAGS := $(shell pkg-config --exists ztos-ial 2>/dev/null && echo -DHAVE_ZTOS_IAL $$(pkg-config --cflags ztos-ial))
 IAL_LIBS := $(shell pkg-config --exists ztos-ial 2>/dev/null && pkg-config --libs --static ztos-ial)
 
-ztmetro: ztmetro.c auth/prompt.c xdg-shell-protocol.h
+# ztRetrofit's styles beside Metro: retro/ (DotMatrix: the dot engine and its launcher)
+RETRO = retro/dotmatrix.c retro/dm-launcher.c retro/dm-chrome.c
+RETRO_DEPS = $(RETRO) core/zrnboard.h retro/dotmatrix.h retro/dm-launcher.h retro/dm-chrome.h retro/dm-glyphs.h
+# every cairo fill and stroke through retro/dm-wrap.c: the style's dots
+DM_WRAP = retro/dm-wrap.c
+DM_WRAP_LDFLAGS = -Wl,--wrap=cairo_fill,--wrap=cairo_fill_preserve,--wrap=cairo_stroke,--wrap=cairo_stroke_preserve,--wrap=cairo_paint
+
+ztmetro: ztmetro.c auth/prompt.c xdg-shell-protocol.h $(RETRO_DEPS) $(DM_WRAP)
 	$(CC) $(CFLAGS) $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) $(IAL_FLAGS) \
-		-o $@ ztmetro.c $(shell pkg-config --libs $(PKGS)) $(IAL_LIBS) -lm -lpthread
+		-o $@ ztmetro.c $(RETRO) $(DM_WRAP) $(DM_WRAP_LDFLAGS) $(shell pkg-config --libs $(PKGS)) $(IAL_LIBS) -lm -lpthread
+
+# the DotMatrix screens rendered offscreen to PNG files, to check them without a phone
+retro/dm-test: retro/dm-test.c $(RETRO_DEPS)
+	$(CC) $(CFLAGS) $(WARN) $(shell pkg-config --cflags egl glesv2 cairo) -o $@ retro/dm-test.c $(RETRO) \
+		$(shell pkg-config --libs egl glesv2 cairo) -lm
 
 xdg-shell-protocol.h:
 	wayland-scanner server-header $(XDG) $@
@@ -44,10 +56,11 @@ apps/ztapps: apps/ztapps.c
 
 # ZrnMetroCore: the window, motion and widgets our own apps share
 VIEWPORTER := $(WP)/stable/viewporter/viewporter.xml
-CORE = core/zrnmetrocore.c core/zrnmetrogpu.c core/xdg-shell-protocol.c core/viewporter-protocol.c
-CORE_DEPS = $(CORE) core/zrnmetrocore.h core/zrnmetrogpu.h core/zrnmetrorender.h core/xdg-shell-client-protocol.h core/viewporter-client-protocol.h
+CORE = core/zrnmetrocore.c core/zrnmetrogpu.c core/xdg-shell-protocol.c core/viewporter-protocol.c \
+	retro/dotmatrix.c retro/dm-chrome.c $(DM_WRAP)
+CORE_DEPS = $(CORE) core/zrnboard.h retro/dotmatrix.h retro/dm-chrome.h retro/dm-glyphs.h core/zrnmetrocore.h core/zrnmetrogpu.h core/zrnmetrorender.h core/xdg-shell-client-protocol.h core/viewporter-client-protocol.h
 APP_BUILD = $(CC) $(CFLAGS) $(WARN) -Icore $(shell pkg-config --cflags $(APP_PKGS)) $(IAL_FLAGS)
-APP_LIBS = $(shell pkg-config --libs $(APP_PKGS)) $(IAL_LIBS) -lm
+APP_LIBS = $(DM_WRAP_LDFLAGS) $(shell pkg-config --libs $(APP_PKGS)) $(IAL_LIBS) -lm
 
 # ztCamera: the camera, in the Lumia Camera look (see camera/CAMERA-DRIVERS.md
 # for why its viewfinder runs against a source that is not a sensor)
@@ -83,6 +96,9 @@ power/ztpower: power/ztpower.c $(CORE_DEPS)
 perfd/zrnperfd: perfd/zrnperfd.c perfd/tickle.c perfd/tickle.h background-apps.h ztos-user.h perfd/iblog.c perfd/iblog.h perfd/ibnet.c perfd/ibnet.h perfd/perfial.c perfd/perfial.h
 	$(CC) $(CFLAGS) $(WARN) -o $@ perfd/zrnperfd.c perfd/tickle.c perfd/iblog.c perfd/ibnet.c perfd/perfial.c -lm
 
+touchkeyd/ztos-touchkeyd: touchkeyd/ztos-touchkeyd.c
+	$(CC) $(CFLAGS) $(WARN) -o $@ touchkeyd/ztos-touchkeyd.c
+
 sensord/ztoscsf-sensord: sensord/ztoscsf-sensord.c
 	$(CC) $(CFLAGS) $(WARN) -o $@ sensord/ztoscsf-sensord.c -lm
 
@@ -102,7 +118,7 @@ phone/ztphone: phone/ztphone.c comm/comm.h $(CORE_DEPS)
 messages/ztmessages: messages/ztmessages.c comm/comm.h $(CORE_DEPS)
 	$(APP_BUILD) -Icomm -o $@ messages/ztmessages.c $(CORE) $(APP_LIBS)
 
-contacts/ztcontacts: contacts/ztcontacts.c comm/comm.h $(CORE_DEPS)
+contacts/ztcontacts: contacts/ztcontacts.c comm/comm.h comm/contact-store.h $(CORE_DEPS)
 	$(APP_BUILD) -Icomm -o $@ contacts/ztcontacts.c $(CORE) $(APP_LIBS)
 
 # the App Store: the repos in pacman.conf and the AUR (see store/README.md)
@@ -117,8 +133,13 @@ store/ztstore: $(STORE) $(wildcard store/*.h) $(CORE_DEPS)
 # browser/README.md). Needs wpewebkit on the phone.
 BROWSER = browser/superscan.c browser/webview.c
 BROWSER_PKGS = wpe-webkit-2.0 wpe-platform-2.0 wpe-platform-headless-2.0 glib-2.0 gobject-2.0 libdrm
-browser/superscan: $(BROWSER) browser/webview.h $(CORE_DEPS)
-	$(APP_BUILD) $(shell pkg-config --cflags $(BROWSER_PKGS)) -o $@ $(BROWSER) $(CORE) $(APP_LIBS) \
+DMABUF_XML = $(shell pkg-config --variable=pkgdatadir wayland-protocols)/stable/linux-dmabuf/linux-dmabuf-v1.xml
+browser/linux-dmabuf-v1-client-protocol.h:
+	wayland-scanner client-header $(DMABUF_XML) $@
+browser/linux-dmabuf-v1-protocol.c:
+	wayland-scanner private-code $(DMABUF_XML) $@
+browser/superscan: $(BROWSER) browser/webview.h browser/linux-dmabuf-v1-client-protocol.h browser/linux-dmabuf-v1-protocol.c $(CORE_DEPS)
+	$(APP_BUILD) -Ibrowser $(shell pkg-config --cflags $(BROWSER_PKGS)) -o $@ $(BROWSER) browser/linux-dmabuf-v1-protocol.c $(CORE) $(APP_LIBS) \
 		$(shell pkg-config --libs $(BROWSER_PKGS))
 
 # kept out of `all`/`install` until WPE is confirmed on the phone, so a missing
@@ -208,6 +229,8 @@ install: check-arch
 	install -Dm644 store/data/ztstore.svg /usr/local/share/icons/hicolor/scalable/apps/ztstore.svg
 	install -Dm755 perfd/zrnperfd /usr/local/sbin/zrnperfd
 	install -Dm644 perfd/zrnperfd.service /etc/systemd/system/zrnperfd.service
+	install -Dm755 touchkeyd/ztos-touchkeyd /usr/local/sbin/ztos-touchkeyd
+	install -Dm644 touchkeyd/ztos-touchkeyd.service /etc/systemd/system/ztos-touchkeyd.service
 	install -Dm755 sensord/ztoscsf-sensord /usr/local/sbin/ztoscsf-sensord
 	install -Dm644 sensord/ztoscsf-sensord.service /etc/systemd/system/ztoscsf-sensord.service
 	install -Dm755 modemd/ztoscorenetworkingd /usr/local/sbin/ztoscorenetworkingd
@@ -218,13 +241,18 @@ install: check-arch
 	install -Dm755 phone/ztphone /usr/local/bin/ztphone
 	install -Dm755 messages/ztmessages /usr/local/bin/ztmessages
 	install -Dm755 contacts/ztcontacts /usr/local/bin/ztcontacts
+	install -Dm755 contacts/zrn_contacts_sync.py /usr/local/bin/zrn-contacts-sync
+	install -Dm755 contacts/zrn-contacts-android /usr/local/bin/zrn-contacts-android
+	install -Dm644 -t /etc/systemd/system contacts/zrn-contacts-android.service contacts/zrn-contacts-android.timer
+	install -Dm644 -t /usr/lib/systemd/user contacts/zrn-contacts-sync.service contacts/zrn-contacts-sync.timer
+	install -Dm644 contacts/google-client.json.template /usr/local/share/ztos/google-client.json.template
 	install -Dm644 -t /usr/local/share/applications comm/ztphone.desktop comm/ztmessages.desktop comm/ztcontacts.desktop
 	install -Dm644 -t /usr/local/share/icons/hicolor/scalable/apps comm/ztphone.svg comm/ztmessages.svg comm/ztcontacts.svg
 	install -Dm644 csf/components /etc/ztoscoresensorframework/components
 	install -Dm644 csf/ztoscoresensorframework.service /etc/systemd/system/ztoscoresensorframework.service
 
 clean:
-	rm -f sound/ztsound osial/ztosial auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps xdg-shell-protocol.h settings/ztsettings devtest/zrndevtest devices/ztdevices power/ztpower perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd csf/ztoscsf notifyd/ztnotifyd splash/ztos-splash \
+	rm -f sound/ztsound osial/ztosial auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps xdg-shell-protocol.h settings/ztsettings devtest/zrndevtest devices/ztdevices power/ztpower perfd/zrnperfd touchkeyd/ztos-touchkeyd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd csf/ztoscsf notifyd/ztnotifyd splash/ztos-splash \
 		phone/ztphone messages/ztmessages contacts/ztcontacts files/ztfiles store/ztstore camera/ztcamera core/viewporter-protocol.c core/viewporter-client-protocol.h \
 		core/xdg-shell-client-protocol.h core/xdg-shell-protocol.c
 

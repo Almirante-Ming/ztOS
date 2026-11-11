@@ -10,6 +10,7 @@ namespace (mke2fs -d, mtools), so nothing is ever mounted for real.
 from __future__ import annotations
 
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -26,7 +27,9 @@ TARBALL = ROOT / "build" / "alarm.tar.gz"
 TARBALL_URL = "http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
 SDK = ROOT / "sdk"
 PKGCACHE = ROOT / "build" / "pkg-cache"
-EDK2 = Path("/usr/share/edk2/aarch64")
+# Arch's edk2-aarch64 package; the Nix development shell exports ZTOS_EDK2
+# with the same QEMU_EFI.fd from nixpkgs.
+EDK2 = Path(os.environ.get("ZTOS_EDK2", "/usr/share/edk2/aarch64"))
 
 
 class Fail(Exception):
@@ -87,7 +90,9 @@ def check_host(target: str = "qemu"):
             missing.append(tool)
     if not Path("/usr/bin/mke2fs").exists() and not Path("/usr/sbin/mke2fs").exists():
         missing.append("mke2fs (e2fsprogs)")
-    if not Path("/proc/sys/fs/binfmt_misc/qemu-aarch64").exists():
+    if platform.machine() not in ("aarch64", "arm64") and not Path(
+        "/proc/sys/fs/binfmt_misc/qemu-aarch64"
+    ).exists():
         missing.append("qemu-user-static + qemu-user-static-binfmt (to run aarch64 programs)")
     user = os.environ.get("USER", "")
     subuid = Path("/etc/subuid").read_text() if Path("/etc/subuid").exists() else ""
@@ -118,7 +123,7 @@ def build_apps(stage: Path):
     out.mkdir(parents=True, exist_ok=True)
     sys.path.insert(0, str(SDK))
     from ztos_sdk import cli as sdk
-    projects = (OS / "apps" / "welcome", OS / "apps" / "whatsapp", ROOT / "apps" / "music")
+    projects = (OS / "apps" / "welcome", ROOT / "apps" / "music")
     for project in projects:
         p = sdk.find_project(str(project))
         python = "%d.%d" % sys.version_info[:2]
@@ -142,10 +147,14 @@ step() { echo "STEP $*"; }
 R=$ROOTFS
 umask 022
 
-if [ "$FRESH" = 1 ] || [ ! -e "$R/etc/arch-release" ]; then
+# A run stopped half way through the unpack leaves etc/arch-release without
+# the rest (no var/lib/pacman): only a mark written after the whole tarball
+# counts as unpacked.
+if [ "$FRESH" = 1 ] || [ ! -e "$R/.ztos-unpacked" ]; then
 	step "unpacking Arch Linux ARM"
 	rm -rf "$R"; mkdir -p "$R"
 	bsdtar -xpf "$TARBALL" -C "$R" --no-xattrs --no-acls --no-fflags
+	touch "$R/.ztos-unpacked"
 fi
 
 mount --bind "$R" "$R"
@@ -223,9 +232,25 @@ ch sh -c 'cd /usr/src/ztmetro && make clean >/dev/null 2>&1; make -j"$(nproc)" &
 ch sh -c 'cd /usr/src/ztmetro && make install-browser'
 ch sh -c 'cd /usr/src/ztmetro && make clean >/dev/null 2>&1' || true
 
+# push messages for Android apps in both runtimes (the sudoers rule comes
+# from the user templates in the rootfs overlay)
+step "building zrn-pushd (push for Android apps)"
+rm -rf "$R/usr/src/zrn-pushd"; mkdir -p "$R/usr/src"
+cp -a --no-preserve=ownership "$SRC/android/push" "$R/usr/src/zrn-pushd"
+ch sh -c 'cd /usr/src/zrn-pushd && make clean >/dev/null 2>&1; make && make install'
+install -Dm644 "$SRC/android/push/README.md" "$R/usr/local/share/doc/zrn-pushd/README.md"
+sc --global enable zrn-pushd.service
+rm -rf "$R/usr/src/zrn-pushd"
+
 step "adding ztOS's files"
 cp -a --no-preserve=ownership "$SRC/os/overlay/." "$R/"
 cp -a --no-preserve=ownership "$SRC/rootfs/overlay/." "$R/"         # every phone's: USB link, session, memory and fs recovery
+# the wallpapers and ringtones: scripts/pack-media.sh
+if [ -f "$SRC/prebuilts/ztos-media/ztos-media.tar.xz.partaa" ]; then
+	cat "$SRC"/prebuilts/ztos-media/ztos-media.tar.xz.part* | tar -C "$R" --no-same-owner -xJf -
+else
+	echo "WARNING: no prebuilts/ztos-media: this image has no wallpapers or ringtones (run scripts/pack-media.sh)" >&2
+fi
 ch update-desktop-database /usr/share/applications
 
 step "adding Android (Waydroid and the recipe for its image)"
@@ -310,8 +335,10 @@ echo LANG=en_US.UTF-8 > "$R/etc/locale.conf"
 step "turning on ztOS's services"
 # (systemd-resolved: names; NetworkManager hands it each network's DNS)
 # (systemd-pstore: the kernel log of a crash or hang is kept in /var/lib/systemd/pstore)
+# (zrnperfd: the CPU and GPU clocks from ztOSIAL's Perf1; without it the
+# GPU rests at its lowest step and ztMETRO lags)
 for u in greetd NetworkManager systemd-resolved sshd systemd-pstore ztos-pstore-keep ztoscoresensorframework ztos-update-check.timer \
-		ztos-iald waydroid-container ztos-waydroid-images; do
+		ztos-iald zrnperfd waydroid-container ztos-waydroid-images; do
 	sc enable "$u" > /dev/null 2>&1 || echo "(could not enable $u)"
 done
 # the user session's sound (Arch only presets them; with no preset run they stay off)

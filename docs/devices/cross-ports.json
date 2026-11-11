@@ -1,6 +1,6 @@
 {
- "generated": "2026-10-26T05:03:51+00:00",
- "pmaports": "435205da9604633a7691d3cb9489f3aa89262c82",
+ "generated": "2026-11-07T10:13:29+00:00",
+ "pmaports": "d58ca1a2fe682277729a43775622fca012711024",
  "devices": [
   {
    "codename": "fairphone-fp4",
@@ -191,6 +191,22 @@
    "archived": false,
    "flash_method": "fastboot",
    "kernel": "linux-ayaneo-pocket-s2",
+   "screen": "",
+   "warnings": []
+  },
+  {
+   "codename": "ayn-odin",
+   "name": "AYN Odin",
+   "manufacturer": "AYN",
+   "year": "2021",
+   "chassis": "tablet",
+   "category": "testing",
+   "soc": "sdm845",
+   "gpu_driver": "freedreno",
+   "accelerated": true,
+   "archived": false,
+   "flash_method": "fastboot",
+   "kernel": "linux-ayn-odin",
    "screen": "",
    "warnings": []
   },
@@ -464,22 +480,6 @@
    "flash_method": "fastboot",
    "kernel": "linux-postmarketos-qcom-sm8250",
    "screen": "1080x2400",
-   "warnings": []
-  },
-  {
-   "codename": "samsung-a72q",
-   "name": "Samsung Galaxy A72",
-   "manufacturer": "Samsung",
-   "year": "2021",
-   "chassis": "handset",
-   "category": "testing",
-   "soc": "sm7125",
-   "gpu_driver": "freedreno",
-   "accelerated": true,
-   "archived": false,
-   "flash_method": "heimdall-bootimg",
-   "kernel": "linux-postmarketos-qcom-sm7125",
-   "screen": "",
    "warnings": []
   },
   {
@@ -1575,24 +1575,6 @@
    "name": "Samsung Galaxy J3 2016",
    "manufacturer": "Samsung",
    "year": "2016",
-   "chassis": "handset",
-   "category": "archived",
-   "soc": "msm8916",
-   "gpu_driver": "freedreno",
-   "accelerated": true,
-   "archived": true,
-   "flash_method": "fastboot",
-   "kernel": "linux-postmarketos-qcom-msm8916",
-   "screen": "720x1280",
-   "warnings": [
-    "postmarketOS no longer maintains this phone's port: it is archived, so it may not build or boot, and it has had no recent testing."
-   ]
-  },
-  {
-   "codename": "samsung-j5",
-   "name": "Samsung Galaxy J5 2015",
-   "manufacturer": "Samsung",
-   "year": "2015",
    "chassis": "handset",
    "category": "archived",
    "soc": "msm8916",

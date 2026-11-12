@@ -7,3 +7,4 @@ wireless-regdb
 python-gobject
 alsa-ucm-conf
 swh-plugins
+i2c-tools

@@ -137,4 +137,11 @@ rm -rf "$R/usr/src/omamobile-bootctl"
 install -m755 "$B/bin/omamobile-boot-success" "$R/usr/bin/omamobile-boot-success"
 install -m644 "$B/vendor/systemd/system/omamobile-boot-success.service" "$R/etc/systemd/system/"
 
-DEVICE_UNITS="zboot-usb-gadget ztos-usb-dhcp zboot-firstboot ztos-wifi bluetooth omamobile-boot-success omamobile-speaker-protection omamobile-camera.timer"
+# USB back after a replug (omarchy-mobile's omamobile-device-cheetah, MIT):
+# the MAX77759's Type-C side opens its USB2 data switch (TCPC register 0x93)
+# on unplug, and with no Type-C driver nothing closes it again. While VBUS is
+# valid this puts it back to 0x09, as the bootloader leaves it; needs i2c-tools.
+install -m755 "$B/bin/omamobile-usb-rescue" "$R/usr/bin/omamobile-usb-rescue"
+install -m644 "$B/vendor/systemd/system/omamobile-usb-rescue.service" "$R/etc/systemd/system/"
+
+DEVICE_UNITS="zboot-usb-gadget ztos-usb-dhcp zboot-firstboot ztos-wifi bluetooth omamobile-boot-success omamobile-speaker-protection omamobile-camera.timer omamobile-usb-rescue"

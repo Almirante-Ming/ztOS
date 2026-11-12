@@ -73,6 +73,20 @@
 		};
 	};
 
+	/*
+	 * The battery, from the stock dtbo's google,battery (entry 22, PANTHER
+	 * MP): google,chg-battery-capacity 4277 mAh, the top of
+	 * google,chg-cv-limits (4.2/4.3/4.45 V) and the gauge model's VEmpty.
+	 * Only the fuel gauge reads it: the charger cell is not enabled (see
+	 * &hsi2c_13), so there are no charge limits here.
+	 */
+	battery: battery {
+		compatible = "simple-battery";
+		charge-full-design-microamp-hours = <4277000>;
+		voltage-max-design-microvolt = <4450000>;
+		voltage-min-design-microvolt = <3300000>;
+	};
+
 	/* UFS VCC: gpp0-1, left on by the bootloader (as cheetah) */
 	ufs_0_fixed_vcc_reg: regulator-ufs-vcc {
 		compatible = "regulator-fixed";
@@ -567,3 +581,107 @@
 
 /* The cameras: main, ultrawide and front */
 #include "gs201-panther-camera.dtsi"
+
+/*
+ * MAX77759 on USI13 (I2C 13), as on cheetah and in the stock dtbo (fragment
+ * 42): Type-C port controller @25, fuel gauge @36, PMIC/charger @66 and @69.
+ * All of its interrupt lines are on ALIVE gpa9, active low with pull-ups.
+ *
+ * Only the fuel gauge is on. It only measures: charge, current, voltage,
+ * temperature, and whether the battery is charging. The charger cell
+ * (pmic@66) is left out on purpose: its probe turns charging off until a
+ * "tcpm-source" power supply reports a source, and the port controller
+ * that would report one stays off because the USB link is our only way
+ * into the phone. Without the driver the charger keeps the bootloader's
+ * settings, and the phone charges as it does today.
+ */
+&usi13 {
+	samsung,mode = <USI_MODE_I2C>;
+	status = "okay";
+};
+
+&hsi2c_13 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	fuel-gauge@36 {
+		compatible = "maxim,max77759-fg";
+		reg = <0x36>;
+		interrupts-extended = <&gpa9 3 IRQ_TYPE_LEVEL_LOW>;
+		pinctrl-0 = <&if_pmic_fg_int>;
+		pinctrl-names = "default";
+		/* maxim,rsense-default = <500> (10 uOhm units) in the stock dtbo */
+		shunt-resistor-micro-ohms = <5000>;
+		monitored-battery = <&battery>;
+
+		/*
+		 * Battery model for the pack with a 1 kOhm ID resistor (ATL,
+		 * DesignCap 0x0873 = 4326 mAh), from the stock dtbo's
+		 * maxim,fg-data (batt-id-kohm 1, model version 2), except
+		 * RelaxCfg 0x143b, the value stock writes over the model's at
+		 * boot (maxim,r_regval_1720x = <0x2a143b>). FilterCfg is already
+		 * stock's filtercfg-default (0xc613).
+		 *
+		 * The driver only writes a model after a gauge power-on reset
+		 * (the battery fully drained or disconnected); otherwise it
+		 * keeps the one stock loaded, and charge_full_design shows which
+		 * pack this is. The other pack (3 kOhm, LSN, DesignCap 0x0891 =
+		 * 4386 mAh) would be:
+		 *   fg-model: 0xa4f0 0xb750 0xb8b0 0xba50 0xbbe0 0xbd60 0xbe70
+		 *     0xbf80 0xc170 0xc320 0xc960 0xced0 0xd210 0xd580 0xd8a0
+		 *     0xdc60 0x0160 0x0f30 0x0e00 0x1210 0x1500 0x1800 0x1520
+		 *     0x0da0 0x0be0 0x07f0 0x06c0 0x06f0 0x06e0 0x06f0 0x05f0
+		 *     0x05f0, then 16 x 0x0200
+		 *   fg-params: as below with DesignCap/FullCapRep/FullCapNom
+		 *     0x0891, dQAcc 0x0224, QRTable 0x2500 0x1180 0x0780 0x0580,
+		 *     TempCo 0x1802
+		 */
+		maxim,fg-model = /bits/ 16 <
+			0x8c80 0xb770 0xb8f0 0xba50 0xbb40 0xbc30 0xbe00 0xbfd0
+			0xc1b0 0xc3a0 0xc6b0 0xc9c0 0xd020 0xd300 0xd5e0 0xdc30
+			0x0080 0x1070 0x1020 0x0ed0 0x0f00 0x1700 0x1530 0x0c20
+			0x0c40 0x07f0 0x07f0 0x06f0 0x0710 0x06d0 0x06f0 0x06f0
+			0x0200 0x0200 0x0200 0x0200 0x0200 0x0200 0x0200 0x0200
+			0x0200 0x0200 0x0200 0x0200 0x0200 0x0200 0x0200 0x0200
+		>;
+		maxim,fg-params = /bits/ 16 <
+			0xf060	/* IAvgEmpty */
+			0x143b	/* RelaxCfg (stock's, not the model's 0x0839) */
+			0x260e	/* LearnCfg */
+			0x4217	/* Config: external thermistor, TEx clear */
+			0x0090	/* Config2 */
+			0x5f00	/* FullSOCThr */
+			0x0873	/* FullCapRep */
+			0x0873	/* DesignCap */
+			0x3200	/* dPAcc */
+			0x021c	/* dQAcc */
+			0x0873	/* FullCapNom */
+			0xa561	/* VEmpty */
+			0x1f00	/* QRTable00 */
+			0x0d80	/* QRTable10 */
+			0x0480	/* QRTable20 */
+			0x0400	/* QRTable30 */
+			0x0740	/* RComp0 */
+			0x1a02	/* TempCo */
+			0x0557	/* IChgTerm */
+			0xed51	/* TGain */
+			0x1eba	/* TOff */
+			0x0014	/* Curve */
+			0x3870	/* MiscCfg */
+			0x1900	/* AtRate */
+			0x2241	/* ConvgCfg */
+			0xc613	/* FilterCfg */
+			0x2d00	/* TaskPeriod */
+		>;
+	};
+};
+
+&pinctrl_gpio_alive {
+	/* the fuel gauge's ALRT line (stock: if-pmic-fg-irq, gpa9-3) */
+	if_pmic_fg_int: if-pmic-fg-int-pins {
+		samsung,pins = "gpa9-3";
+		samsung,pin-function = <GS101_PIN_FUNC_EINT>;
+		samsung,pin-pud = <GS101_PIN_PULL_UP>;
+		samsung,pin-drv = <GS101_PIN_DRV_2_5_MA>;
+	};
+};

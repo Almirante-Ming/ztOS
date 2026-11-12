@@ -77,14 +77,18 @@
 	 * The battery, from the stock dtbo's google,battery (entry 22, PANTHER
 	 * MP): google,chg-battery-capacity 4277 mAh, the top of
 	 * google,chg-cv-limits (4.2/4.3/4.45 V) and the gauge model's VEmpty.
-	 * Only the fuel gauge reads it: the charger cell is not enabled (see
-	 * &hsi2c_13), so there are no charge limits here.
+	 * The charge limits are for the charger cell (pmic@66): 4.45 V, the
+	 * top CV step, and 0.3C (1266720 uA, the nearest CHGCC step under
+	 * 0.3 x 4277 mAh). The temperature guard (max77759_charger temp_guard)
+	 * steps both down by stock's google,chg-temp-limits table.
 	 */
 	battery: battery {
 		compatible = "simple-battery";
 		charge-full-design-microamp-hours = <4277000>;
 		voltage-max-design-microvolt = <4450000>;
 		voltage-min-design-microvolt = <3300000>;
+		constant-charge-voltage-max-microvolt = <4450000>;
+		constant-charge-current-max-microamp = <1266720>;
 	};
 
 	/* UFS VCC: gpp0-1, left on by the bootloader (as cheetah) */
@@ -592,13 +596,14 @@
  * 42): Type-C port controller @25, fuel gauge @36, PMIC/charger @66 and @69.
  * All of its interrupt lines are on ALIVE gpa9, active low with pull-ups.
  *
- * Only the fuel gauge is on. It only measures: charge, current, voltage,
- * temperature, and whether the battery is charging. The charger cell
- * (pmic@66) is left out on purpose: its probe turns charging off until a
- * "tcpm-source" power supply reports a source, and the port controller
- * that would report one stays off because the USB link is our only way
- * into the phone. Without the driver the charger keeps the bootloader's
- * settings, and the phone charges as it does today.
+ * The fuel gauge and the PMIC/charger (pmic@66) are on; the Type-C port
+ * controller @25 is not, because the USB link is our only way into the
+ * phone. Without it no "tcpm-source" ever reports a source, so the charger
+ * runs as on cheetah (omarchy-mobile USB-C-PLAN, gate D1): modprobe options
+ * default_ilim_ua=500000 (charge at once, as the bootloader did) and
+ * temp_guard=1, keep_wcin=1 (kernel/panther/patches/0005: the wireless
+ * input stays on and counts as a source). omamobile-usb-rescue closes the
+ * USB data switch the port controller opens on unplug.
  */
 &usi13 {
 	samsung,mode = <USI_MODE_I2C>;
@@ -679,9 +684,37 @@
 			0x2d00	/* TaskPeriod */
 		>;
 	};
+
+	/* stock: max77759 (fragment 39), irq gpa9-4 (if-pmic-irq) */
+	pmic@66 {
+		compatible = "maxim,max77759";
+		reg = <0x66>;
+		interrupts-extended = <&gpa9 4 IRQ_TYPE_LEVEL_LOW>;
+		pinctrl-0 = <&if_pmic_int>;
+		pinctrl-names = "default";
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		monitored-battery = <&battery>;
+
+		gpio {
+			compatible = "maxim,max77759-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+		};
+	};
 };
 
 &pinctrl_gpio_alive {
+	/* the PMIC's interrupt line (stock: if-pmic-irq, gpa9-4) */
+	if_pmic_int: if-pmic-int-pins {
+		samsung,pins = "gpa9-4";
+		samsung,pin-function = <GS101_PIN_FUNC_EINT>;
+		samsung,pin-pud = <GS101_PIN_PULL_UP>;
+		samsung,pin-drv = <GS101_PIN_DRV_2_5_MA>;
+	};
+
 	/* the fuel gauge's ALRT line (stock: if-pmic-fg-irq, gpa9-3) */
 	if_pmic_fg_int: if-pmic-fg-int-pins {
 		samsung,pins = "gpa9-3";

@@ -1,0 +1,80 @@
+diff --git a/drivers/power/supply/max77759_charger.c b/drivers/power/supply/max77759_charger.c
+index 572279b06..ab1def83a 100644
+--- a/drivers/power/supply/max77759_charger.c
++++ b/drivers/power/supply/max77759_charger.c
+@@ -44,6 +44,11 @@ MODULE_PARM_DESC(default_ilim_ua,
+  * (Google's google,battery node on gs201 phones: chg-temp-limits,
+  * chg-cv-limits, chg-cc-limits). Off by default.
+  */
++static bool keep_wcin;
++module_param(keep_wcin, bool, 0444);
++MODULE_PARM_DESC(keep_wcin,
++		 "Leave the wireless input (WCIN) as the bootloader set it and report it as a charging source");
++
+ static bool temp_guard;
+ module_param(temp_guard, bool, 0644);
+ MODULE_PARM_DESC(temp_guard,
+@@ -79,6 +84,7 @@ static const u8 guard_cc_pct[GUARD_NBANDS][GUARD_NTIERS] = {
+ #define FOREACH_IRQ(S)			\
+ 	S(AICL),			\
+ 	S(CHGIN),			\
++	S(WCIN),			\
+ 	S(CHG),				\
+ 	S(INLIM),			\
+ 	S(BAT_OILO),			\
+@@ -159,7 +165,20 @@ static int charger_input_valid(struct max77759_charger *chg)
+ 		return ret;
+ 
+ 	return (val & MAX77759_CHGR_REG_CHG_INT_CHG) &&
+-		(val & MAX77759_CHGR_REG_CHG_INT_CHGIN);
++		(val & (MAX77759_CHGR_REG_CHG_INT_CHGIN |
++			(keep_wcin ? MAX77759_CHGR_REG_CHG_INT_WCIN : 0)));
++}
++
++/* A wireless pad on WCIN, as the charger sees it */
++static bool wcin_valid(struct max77759_charger *chg)
++{
++	u32 val;
++
++	if (!keep_wcin ||
++	    regmap_read(chg->regmap, MAX77759_CHGR_REG_CHG_INT_OK, &val))
++		return false;
++
++	return val & MAX77759_CHGR_REG_CHG_INT_WCIN;
+ }
+ 
+ static int get_online(struct max77759_charger *chg)
+@@ -177,7 +196,8 @@ static int get_online(struct max77759_charger *chg)
+ 
+ 	guard(mutex)(&chg->lock);
+ 
+-	return (val & MAX77759_CHGR_REG_CHG_DETAILS_02_CHGIN_STS) &&
++	return ((val & MAX77759_CHGR_REG_CHG_DETAILS_02_CHGIN_STS) ||
++		wcin_valid(chg)) &&
+ 		(chg->mode == MAX77759_CHGR_MODE_CHG_BUCK_ON);
+ }
+ 
+@@ -643,11 +663,18 @@ static int max77759_charger_init(struct max77759_charger *chg)
+ 	if (ret)
+ 		return ret;
+ 
+-	/* Disable wireless charging input */
+-	ret = regmap_update_bits(chg->regmap, MAX77759_CHGR_REG_CHG_CNFG_12,
+-				 MAX77759_CHGR_REG_CHG_CNFG_12_WCINSEL, 0);
+-	if (ret)
+-		goto relock;
++	/*
++	 * Disable wireless charging input, unless keep_wcin: then WCINSEL
++	 * stays as the bootloader left it (on, on the Pixel 7), and the pad
++	 * charges through the wireless receiver's own settings.
++	 */
++	if (!keep_wcin) {
++		ret = regmap_update_bits(chg->regmap,
++					 MAX77759_CHGR_REG_CHG_CNFG_12,
++					 MAX77759_CHGR_REG_CHG_CNFG_12_WCINSEL, 0);
++		if (ret)
++			goto relock;
++	}
+ 
+ 	ret = regmap_update_bits(chg->regmap, MAX77759_CHGR_REG_CHG_CNFG_18,
+ 				 MAX77759_CHGR_REG_CHG_CNFG_18_WDTEN, 0);

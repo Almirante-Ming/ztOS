@@ -143,5 +143,8 @@ install -m644 "$B/vendor/systemd/system/omamobile-boot-success.service" "$R/etc/
 # valid this puts it back to 0x09, as the bootloader leaves it; needs i2c-tools.
 install -m755 "$B/bin/omamobile-usb-rescue" "$R/usr/bin/omamobile-usb-rescue"
 install -m644 "$B/vendor/systemd/system/omamobile-usb-rescue.service" "$R/etc/systemd/system/"
+# the charger's temperature guard, at runtime: omamobile-charge-guard status|on|off
+# (its modprobe options: overlay/etc/modprobe.d/ztos-charger.conf)
+install -m755 "$B/bin/omamobile-charge-guard" "$R/usr/bin/omamobile-charge-guard"
 
 DEVICE_UNITS="zboot-usb-gadget ztos-usb-dhcp zboot-firstboot ztos-wifi bluetooth omamobile-boot-success omamobile-speaker-protection omamobile-camera.timer omamobile-usb-rescue"

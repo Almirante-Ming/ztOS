@@ -81,8 +81,8 @@ static inline const char *hw_charger(void)
 		if (f) {
 			fclose(f);
 		} else {
-			for (int i = 0; i < 8; i++) {
-				const char *names[] = { "ac", "usb", "AC", "USB", "charger", "mains", "max77705-charger", "pm8941-charger" };
+			for (int i = 0; i < 9; i++) {
+				const char *names[] = { "ac", "usb", "AC", "USB", "charger", "mains", "max77705-charger", "max77759-charger", "pm8941-charger" };
 				char probe[160];
 				snprintf(probe, sizeof(probe), "/sys/class/power_supply/%s/online", names[i]);
 				if ((f = fopen(probe, "r"))) {

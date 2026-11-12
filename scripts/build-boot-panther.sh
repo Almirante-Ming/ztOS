@@ -86,7 +86,7 @@ done
 [ -z "$added" ] || make -C "$SRC" O="$KO" olddefconfig > /dev/null
 if [ -n "$KERNEL" ]; then
 	echo "=== kernel ==="
-	make -C "$SRC" O="$KO" -j"$(nproc)" Image exynos/google/gs201-panther.dtb
+	make -C "$SRC" O="$KO" -j"${JOBS:-$(nproc)}" Image exynos/google/gs201-panther.dtb
 else
 	# the board file may have changed even when the kernel has not
 	make -C "$SRC" O="$KO" exynos/google/gs201-panther.dtb > /dev/null

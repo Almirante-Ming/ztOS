@@ -25,6 +25,7 @@ backend = "generic"
 battery = "/sys/class/power_supply/max170xx_battery"
 current_sign = 1                 # max170xx: + charging, - draining, as ztOSIAL
 current_node = "/sys/class/power_supply/max170xx_battery/current_now"
+charger = "/sys/class/power_supply/max77759-charger"   # online/status: USB (CHGIN) or wireless (WCIN)
 
 [ial.Perf1]
 backend = "generic"

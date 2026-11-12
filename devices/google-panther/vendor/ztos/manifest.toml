@@ -1,8 +1,8 @@
 # ztOSIAL manifest: Google Pixel 7 (panther), Tensor G2 (gs201), on mainline
 # Linux (omarchy-mobile's kernel with ztOS's board file, kernel/panther/).
 # Generic backends everywhere. Not there yet, and so hidden by ztOS: the
-# battery and charger, cpufreq (ACPM DVFS), thermal zones, haptics, the
-# modem. The AoC's sensors are iio-sensor-proxy's D-Bus API (omamobile-sensors),
+# charger (only the fuel gauge is driven), cpufreq (ACPM DVFS), thermal
+# zones, haptics, the modem. The AoC's sensors are iio-sensor-proxy's D-Bus API (omamobile-sensors),
 # not IIO devices.
 
 [device]
@@ -17,6 +17,14 @@ min = "0.2.0"
 [ial.Display1]
 backend = "generic"
 node = "/sys/class/backlight/1c2c0000.dsi.0"
+
+# The MAX77759 fuel gauge (kernel/panther/gs201-panther.dts). No charger
+# supply: the gauge's own current tells charging from draining.
+[ial.Power1]
+backend = "generic"
+battery = "/sys/class/power_supply/max170xx_battery"
+current_sign = 1                 # max170xx: + charging, - draining, as ztOSIAL
+current_node = "/sys/class/power_supply/max170xx_battery/current_now"
 
 [ial.Perf1]
 backend = "generic"
